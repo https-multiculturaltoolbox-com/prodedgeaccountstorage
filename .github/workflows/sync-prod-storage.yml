@@ -1,0 +1,64 @@
+name: Sync prodedgeaccountstorage to repo
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # daily 02:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Azure CLI
+        uses: azure/setup-azure@v4
+
+      - name: List containers & download all blobs
+        env:
+          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+        run: |
+          set -euo pipefail
+          ROOT="azure/prodedgeaccountstorage"
+          mkdir -p "$ROOT"
+
+          # get all container names
+          mapfile -t CONTAINERS < <(az storage container list \
+            --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --account-key "$AZURE_STORAGE_KEY" \
+            --query "[].name" -o tsv)
+
+          echo "Found containers: ${CONTAINERS[*]}"
+
+          for c in "${CONTAINERS[@]}"; do
+            TARGET="$ROOT/$c"
+            echo "Syncing container '$c' -> $TARGET"
+            rm -rf "$TARGET"
+            mkdir -p "$TARGET"
+
+            az storage blob download-batch \
+              --account-name "$AZURE_STORAGE_ACCOUNT" \
+              --account-key "$AZURE_STORAGE_KEY" \
+              -s "$c" \
+              -d "$TARGET" \
+              --no-progress
+          done
+
+      - name: Commit & push if changes
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git status --porcelain | grep -q '^\( M\| M\|A \|D \|??\)'; then
+            git add azure/prodedgeaccountstorage
+            git commit -m "Sync prodedgeaccountstorage containers ($(date -u +'%Y-%m-%d %H:%M:%S UTC'))"
+            git push
+          else
+            echo "No changes to commit."
+          fi
