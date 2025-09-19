@@ -1,157 +1,78 @@
-name: Sync Azure Blobs to Repo (batch, robust)
+name: Sync Azure Blob (chunked) to Repo
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 2 * * *"   # 02:00 UTC daily
+    inputs:
+      prefixes:
+        description: "Space-separated prefixes to fetch (e.g., logs/2025-09-18/ images/)"
+        required: true
+        default: "logs/"
 
 permissions:
-  contents: write
+  contents: write  # to push back to repo
+  id-token: write  # needed for workload identity/OIDC login
 
 env:
-  ROOT_DIR: azure
-  MANIFEST_DIR: .sync-manifest
-  COMMIT_AUTHOR_NAME: azure-sync-bot
-  COMMIT_AUTHOR_EMAIL: noreply@example.com
-  COMMIT_BRANCH: main
+  AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+  AZURE_CONTAINER: ${{ secrets.AZURE_CONTAINER }}
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Verify secrets
-        shell: bash
+      - name: Configure git author
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id:     ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:     ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install AzCopy
+        run: |
+          curl -sL https://aka.ms/downloadazcopy-v10-linux | tar -xz --strip-components=1
+          sudo mv azcopy /usr/local/bin/azcopy
+          azcopy --version
+
+      - name: Generate User Delegation SAS
+        id: gensas
+        run: |
+          expiry=$(date -u -d "+2 hours" '+%Y-%m-%dT%H:%MZ')
+          SAS=$(az storage container generate-sas \
+            --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --name "$AZURE_CONTAINER" \
+            --permissions rl \
+            --expiry $expiry \
+            --auth-mode login \
+            -o tsv)
+          echo "sas=$SAS" >> $GITHUB_OUTPUT
+
+      - name: Sync chunks from Azure → repo
         env:
-          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
-          AZURE_STORAGE_SAS_TOKEN: ${{ secrets.AZURE_STORAGE_SAS_TOKEN }}
-          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+          SAS: ${{ steps.gensas.outputs.sas }}
+          PREFIXES: ${{ github.event.inputs.prefixes }}
         run: |
           set -euo pipefail
-          if [ -z "${AZURE_STORAGE_ACCOUNT:-}" ]; then
-            echo "ERROR: Missing secret AZURE_STORAGE_ACCOUNT"; exit 1
-          fi
-          if [ -z "${AZURE_STORAGE_SAS_TOKEN:-}" ] && [ -z "${AZURE_STORAGE_KEY:-}" ]; then
-            echo "ERROR: Provide AZURE_STORAGE_SAS_TOKEN (preferred) or AZURE_STORAGE_KEY"; exit 1
-          fi
+          for p in $PREFIXES; do
+            echo "==> Fetching $p"
+            azcopy copy \
+              "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}/${p}?${SAS}" \
+              "./$p" --recursive
+          done
 
-      - name: Azure CLI (mirror via download-batch + rebuild manifests)
-        uses: azure/CLI@v2
-        env:
-          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
-          AZURE_STORAGE_SAS_TOKEN: ${{ secrets.AZURE_STORAGE_SAS_TOKEN }}
-          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
-          ROOT_DIR: ${{ env.ROOT_DIR }}
-          MANIFEST_DIR: ${{ env.MANIFEST_DIR }}
-        with:
-          azcliversion: 2.63.0
-          inlineScript: |
-            set -euo pipefail
-
-            mkdir -p "$ROOT_DIR" "$MANIFEST_DIR"
-
-            # Build auth args (prefer SAS)
-            AUTH_ARGS=( --account-name "${AZURE_STORAGE_ACCOUNT}" )
-            if [ -n "${AZURE_STORAGE_SAS_TOKEN:-}" ]; then
-              AUTH_ARGS+=( --sas-token "${AZURE_STORAGE_SAS_TOKEN}" )
-            else
-              AUTH_ARGS+=( --account-key "${AZURE_STORAGE_KEY}" )
-            fi
-
-            echo "Listing containers in ${AZURE_STORAGE_ACCOUNT}..."
-            mapfile -t CONTAINERS < <(
-              az storage container list \
-                --only-show-errors \
-                "${AUTH_ARGS[@]}" \
-                --query "[].name" -o tsv
-            )
-
-            echo "Found ${#CONTAINERS[@]} containers."
-            for c in "${CONTAINERS[@]}"; do
-              [ -z "$c" ] && continue
-              echo "::group::Sync container: $c"
-              TARGET="${ROOT_DIR}/${c}"
-              MANIFEST="${MANIFEST_DIR}/${c}.tsv"
-              mkdir -p "${TARGET}"
-
-              # 1) Mirror everything in this container (no per-blob --name)
-              az storage blob download-batch \
-                --only-show-errors \
-                "${AUTH_ARGS[@]}" \
-                --source "$c" \
-                --destination "${TARGET}" \
-                --overwrite
-
-              # 2) Rebuild manifest with pagination (etag<TAB>name)
-              tmp="${MANIFEST}.tmp"
-              : > "$tmp"
-              blob_marker=""
-              while :; do
-                # page -> json
-                page_json="$(az storage blob list \
-                  --only-show-errors \
-                  "${AUTH_ARGS[@]}" \
-                  --container-name "$c" \
-                  ${blob_marker:+--marker "$blob_marker"} \
-                  -o json)"
-                # append to manifest tmp
-                python3 - "$tmp" <<'PY'
-import sys, json
-out = sys.argv[1]
-data = json.loads(sys.stdin.read())
-with open(out, "a", encoding="utf-8") as f:
-    for b in data:
-        name = (b.get("name") or "").strip()
-        etag = ((b.get("properties") or {}).get("etag") or "").strip()
-        if name and etag:
-            f.write(f"{etag}\t{name}\n")
-PY
-                # next marker
-                blob_marker="$(az storage blob list \
-                  --only-show-errors \
-                  "${AUTH_ARGS[@]}" \
-                  --container-name "$c" \
-                  ${blob_marker:+--marker "$blob_marker"} \
-                  --query 'nextMarker' -o tsv || true)"
-                [ -z "$blob_marker" ] && break
-              done
-
-              # dedupe by name, keep last etag if duplicates
-              if [ -s "$tmp" ]; then
-                # sort by name (field 2), unique by name, keep last occurrence
-                tac "$tmp" | awk -F'\t' '!seen[$2]++' | tac > "$MANIFEST"
-                rm -f "$tmp"
-              else
-                : > "$MANIFEST"
-              fi
-
-              echo "::endgroup::"
-            done
-
-      - name: Commit changes
-        shell: bash
-        env:
-          ROOT_DIR: ${{ env.ROOT_DIR }}
-          MANIFEST_DIR: ${{ env.MANIFEST_DIR }}
-          COMMIT_AUTHOR_NAME: ${{ env.COMMIT_AUTHOR_NAME }}
-          COMMIT_AUTHOR_EMAIL: ${{ env.COMMIT_AUTHOR_EMAIL }}
-          COMMIT_BRANCH: ${{ env.COMMIT_BRANCH }}
+      - name: Commit & Push
         run: |
-          set -euo pipefail
-          git config user.name  "${COMMIT_AUTHOR_NAME}"
-          git config user.email "${COMMIT_AUTHOR_EMAIL}"
-
-          git add "${ROOT_DIR}" "${MANIFEST_DIR}"
-
-          if git diff --cached --quiet; then
+          git add .
+          if ! git diff --cached --quiet; then
+            git commit -m "Sync from Azure (chunked) - $(date -u)"
+            git push
+          else
             echo "No changes to commit."
-            exit 0
           fi
-
-          git commit -m "Mirror Azure blobs & update manifests"
-          git push origin "${COMMIT_BRANCH}"
