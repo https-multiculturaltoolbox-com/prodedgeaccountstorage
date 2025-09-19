@@ -18,44 +18,54 @@ env:
 jobs:
   sync:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Free disk (adds ~20–30GB)
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure git author
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc "/usr/local/share/boost" || true
-          docker system prune -af || true
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Ensure sparse-checkout (if enabled earlier) doesn't block us
+          git sparse-checkout disable || true
+          git config advice.updateSparsePath false || true
+
+      # Optional but helpful on busy runners
+      - name: Cleanup disk space before sync (optional)
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf "/usr/local/share/boost" || true
           sudo apt-get clean || true
           df -h
 
-      # Clone the repo directly to /mnt (big disk)
-      - name: Clone repository to /mnt
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Prep roomy /mnt dirs & move repo there
         run: |
           set -euo pipefail
-          sudo mkdir -p /mnt/work
-          sudo chown "$USER":"$USER" /mnt/work
-          cd /mnt/work
-          git clone --depth=1 "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
-          cd repo
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config gc.auto 0
-          git config advice.updateSparsePath false
-          git sparse-checkout init --cone
-          mkdir -p __keep__ && : > __keep__/.keep
-          git sparse-checkout set __keep__
+          sudo mkdir -p /mnt/work /mnt/aztmp /mnt/work/tmp
+          sudo chown -R "$USER":"$USER" /mnt/work /mnt/aztmp
+          # Move the checked-out repo to /mnt so git writes live on the large volume
+          rsync -a --delete "$GITHUB_WORKSPACE"/ /mnt/work/repo/
+          echo "REPO_DIR=/mnt/work/repo" >> "$GITHUB_ENV"
+          echo "TMP_BASE=/mnt/work/tmp"    >> "$GITHUB_ENV"
+          echo "AZTMP=/mnt/aztmp"          >> "$GITHUB_ENV"
+          df -h / /mnt || true
 
       - name: Install AzCopy (v10)
         run: |
+          set -euo pipefail
           curl -sL https://aka.ms/downloadazcopy-v10-linux | tar -xz --strip-components=1
           sudo mv azcopy /usr/local/bin/azcopy
           azcopy --version
 
-      - name: Download → slice copy → commit → drop (space-safe)
-        working-directory: /mnt/work/repo
+      - name: Download and commit per prefix (account key auth + robust)
         env:
-          PREFIXES: ${{ github.event.inputs.prefixes }}
-          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+          PREFIXES:            ${{ github.event.inputs.prefixes }}
+          AZURE_STORAGE_KEY:   ${{ secrets.AZURE_STORAGE_KEY }}
+        working-directory: ${{ env.REPO_DIR }}
         run: |
           set -euo pipefail
 
@@ -64,125 +74,83 @@ jobs:
           : "${AZURE_CONTAINER:?AZURE_CONTAINER missing}"
           : "${PREFIXES:?No prefixes provided}"
 
-          # Use roomy /mnt for temp and logs
-          TMPROOT="/mnt/aztmp"; mkdir -p "$TMPROOT"
+          # Make azcopy more stable on busy runners
+          ulimit -n 65536 || true
+
+          # AzCopy auth & tuning (env var replaces the removed CLI flag)
           export AZCOPY_ACCOUNT_KEY="${AZURE_STORAGE_KEY}"
           export AZCOPY_CONCURRENCY_VALUE=8
-          export AZCOPY_LOG_LOCATION="/mnt/aztmp/azcopy-logs"
-          mkdir -p "$AZCOPY_LOG_LOCATION"
+          export AZCOPY_LOG_LOCATION="${AZTMP}/azcopy-logs"
+          export AZCOPY_JOB_PLAN_LOCATION="${AZTMP}/azcopy-plan"
+          mkdir -p "$AZCOPY_LOG_LOCATION" "$AZCOPY_JOB_PLAN_LOCATION"
 
-          commit_if_needed () {
-            local label="$1"
-            if ! git diff --cached --quiet -- .; then
-              git commit -m "Sync slice: ${label} - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-              git push
-            else
-              echo "No changes for ${label}."
-            fi
-          }
+          # Temp root lives on /mnt (large disk), not inside the repo
+          TMPROOT="$(mktemp -d -p "${TMP_BASE}" azsync.XXXXXX)"
+          trap 'rm -rf "$TMPROOT"' EXIT
 
-          process_dir () {
-            local src_root="$1"  # temp root
-            local rel_dir="$2"   # relative dir inside temp
-            local tgt_prefix="$3" # "." or "./prefix"
-            echo "  -> Dir slice: $rel_dir"
-            git sparse-checkout set __keep__ "${tgt_prefix#./}/${rel_dir}"
-            mkdir -p "${tgt_prefix}/${rel_dir}"
-            rsync -a --delete "${src_root}/${rel_dir}/" "${tgt_prefix}/${rel_dir}/"
-            git add -- "${tgt_prefix}/${rel_dir}"
-            commit_if_needed "${rel_dir}"
-            git sparse-checkout set __keep__
-            git clean -fdx
-            rm -rf "${src_root:?}/${rel_dir}"
-          }
+          HAD_ERRORS=0
 
-          process_files_batch () {
-            local src_root="$1"; shift
-            local tgt_prefix="$1"; shift
-            local label="$1"; shift
-            echo "  -> Files batch: $label"
-            # Expand sparse view to include all batch files’ parent dirs
-            patterns=( "__keep__" )
-            for f in "$@"; do
-              parent="$(dirname -- "$f")"
-              [ "$parent" = "." ] || patterns+=( "${tgt_prefix#./}/${parent}" )
-            done
-            git sparse-checkout set -- "${patterns[@]}"
-
-            # Copy the files
-            for f in "$@"; do
-              mkdir -p "${tgt_prefix}/$(dirname -- "$f")"
-              rsync -a "${src_root}/${f}" "${tgt_prefix}/${f}"
-            done
-
-            git add -- "${tgt_prefix}"
-            commit_if_needed "files:${label}"
-            git sparse-checkout set __keep__
-            git clean -fdx
-
-            # Remove from temp
-            for f in "$@"; do rm -f "${src_root}/${f}"; done
-          }
-
-          # Iterate requested prefixes
-          for P in ${PREFIXES}; do
-            P="${P%/}"
-            if [ -z "$P" ] || [ "$P" = "/" ]; then continue; fi
-
-            if [ "$P" = "." ]; then
+          # Iterate prefixes provided by the dispatch input.
+          for p in $PREFIXES; do
+            if [ "$p" = "." ] || [ "$p" = "/" ] || [ -z "$p" ]; then
               SRC_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}"
               TARGET_DIR="."
               LABEL="(root)"
-              DEST_LOCAL="$(mktemp -d "${TMPROOT%/}/root.XXXX")"
+              DEST_LOCAL="${TMPROOT}/root"
             else
-              SRC_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}/${P}"
-              TARGET_DIR="./$P"
-              LABEL="$P"
-              DEST_LOCAL="$(mktemp -d "${TMPROOT%/}/${P//\//_}.XXXX")"
+              SRC_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}/${p}"
+              TARGET_DIR="./$p"
+              LABEL="$p"
+              DEST_LOCAL="${TMPROOT}/${p}"
             fi
 
-            echo "==> AzCopy: ${LABEL} -> ${DEST_LOCAL}"
+            echo "==> Downloading: $LABEL"
+            mkdir -p "$DEST_LOCAL"
+
+            # Run AzCopy; do not hard-fail the whole job on non-zero so we can still commit what we got
             set +e
             azcopy copy "$SRC_URL" "$DEST_LOCAL" --recursive --log-level INFO
-            AC=$?
+            AC_STATUS=$?
             set -e
-            if [ $AC -ne 0 ]; then
-              echo "::warning::AzCopy returned $AC for $LABEL (see logs in $AZCOPY_LOG_LOCATION). Continuing."
-            fi
 
-            echo "==> Slice copy into repo: $LABEL"
-            mkdir -p "$TARGET_DIR"
-
-            # One directory per commit
-            find "$DEST_LOCAL" -mindepth 1 -maxdepth 1 -type d -printf '%P\n' | sort | \
-            while IFS= read -r d; do
-              [ -n "$d" ] || continue
-              process_dir "$DEST_LOCAL" "$d" "$TARGET_DIR"
-              df -h
-            done
-
-            # Top-level files in batches of 200 (handles spaces safely enough for blob names)
-            BATCH=()
-            COUNT=0
-            while IFS= read -r f; do
-              BATCH+=("$f"); COUNT=$((COUNT+1))
-              if [ $COUNT -ge 200 ]; then
-                process_files_batch "$DEST_LOCAL" "$TARGET_DIR" "${BATCH[0]}..+$((${#BATCH[@]}-1))" "${BATCH[@]}"
-                BATCH=(); COUNT=0; df -h
+            # Summarize any AzCopy issues (keep logs off-repo under /mnt/aztmp)
+            LASTLOG="$(ls -t "${AZCOPY_LOG_LOCATION}"/*.log 2>/dev/null | head -n1 || true)"
+            if [ "$AC_STATUS" -ne 0 ]; then
+              HAD_ERRORS=1
+              echo "::warning::AzCopy returned $AC_STATUS for ${LABEL}. See $LASTLOG"
+              if [ -n "$LASTLOG" ]; then
+                echo "---- AzCopy error tail (${LABEL}) ----"
+                tail -n 200 "$LASTLOG" | sed 's/^/LOG: /'
+                echo "---------------------------------------"
               fi
-            done < <(find "$DEST_LOCAL" -mindepth 1 -maxdepth 1 -type f -printf '%P\n' | sort)
-
-            if [ ${#BATCH[@]} -gt 0 ]; then
-              process_files_batch "$DEST_LOCAL" "$TARGET_DIR" "${BATCH[0]}..+$((${#BATCH[@]}-1))" "${BATCH[@]}"
-              BATCH=(); COUNT=0; df -h
             fi
 
-            echo "==> Done prefix: $LABEL"
+            echo "==> Rsync into repo: $LABEL"
+            mkdir -p "$TARGET_DIR"
+            # Keep copy efficient; source on /mnt, target is repo on /mnt as well
+            rsync -a "$DEST_LOCAL"/ "$TARGET_DIR"/ || true
+
+            echo "==> Commit & push for $LABEL"
+            git add --all "$TARGET_DIR" || true
+            if ! git diff --cached --quiet -- "$TARGET_DIR"; then
+              git commit -m "Sync from Azure ${LABEL} - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+              git push
+            else
+              echo "No changes for ${LABEL}."
+            fi
+
+            echo "==> Clean temp for $LABEL"
             rm -rf "$DEST_LOCAL"
-            df -h
+
+            # Optional: compact the repo occasionally to save space on the runner
+            # git gc --prune=now || true
           done
 
-          echo "AzCopy logs: $AZCOPY_LOG_LOCATION"
+          echo "AzCopy logs at: $AZCOPY_LOG_LOCATION"
+          df -h "${PWD}" /mnt || true
 
-      - name: Final disk report
-        run: df -h
+          # If you want the job to fail when AzCopy had any errors, uncomment below:
+          # if [ "$HAD_ERRORS" -ne 0 ]; then
+          #   echo "::error::Finished with AzCopy errors (see logs above)."
+          #   exit 1
+          # fi
