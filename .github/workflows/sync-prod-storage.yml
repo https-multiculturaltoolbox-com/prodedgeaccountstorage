@@ -19,55 +19,28 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Configure git author
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Install AzCopy (v10)
-        run: |
-          curl -sL https://aka.ms/downloadazcopy-v10-linux | tar -xz --strip-components=1
-          sudo mv azcopy /usr/local/bin/azcopy
-          azcopy --version
-
-      - name: Download and commit per chunk (public container)
+      - name: Download and commit per chunk (with cleanup)
         env:
           PREFIXES: ${{ github.event.inputs.prefixes }}
+          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
         run: |
           set -euo pipefail
-          if [ -z "${PREFIXES:-}" ]; then
-            echo "::error::No prefixes provided."
-            exit 1
-          fi
-
-          TMPROOT="$(mktemp -d)"
-          trap 'rm -rf "$TMPROOT"' EXIT
-
+          export AZCOPY_ACCOUNT_KEY="$AZURE_STORAGE_KEY"
+      
+          TMPROOT="$(mktemp -d)"; trap 'rm -rf "$TMPROOT"' EXIT
           for p in $PREFIXES; do
-            echo "==> Downloading: $p"
+            echo "==> Downloading prefix: $p"
             SRC_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}/${p}"
             DEST_LOCAL="${TMPROOT}/${p}"
             mkdir -p "$DEST_LOCAL"
-
-            # No SAS, no login — works only if container has public read
             azcopy copy "$SRC_URL" "$DEST_LOCAL" --recursive
-
-            echo "==> Copy into repo: $p"
-            mkdir -p "./$p"
-            rsync -a "$DEST_LOCAL"/ "./$p"/ || true
-
-            echo "==> Commit & push for $p"
+            mkdir -p "./$p"; rsync -a "$DEST_LOCAL"/ "./$p"/ || true
             git add "$p"
             if ! git diff --cached --quiet -- "$p"; then
-              git commit -m "Sync (public) from Azure (${p}) - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+              git commit -m "Sync from Azure (${p}) - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
               git push
             else
               echo "No changes for $p."
             fi
-
-            echo "==> Clean temp for $p"
             rm -rf "$DEST_LOCAL"
           done
