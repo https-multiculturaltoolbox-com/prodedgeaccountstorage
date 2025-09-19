@@ -54,6 +54,7 @@ jobs:
           AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
         run: |
           set -euo pipefail
+          REPO_ROOT="$GITHUB_WORKSPACE"
 
           : "${AZURE_STORAGE_KEY:?AZURE_STORAGE_KEY missing}"
           : "${AZURE_STORAGE_ACCOUNT:?AZURE_STORAGE_ACCOUNT missing}"
@@ -72,16 +73,16 @@ jobs:
           mkdir -p "$AZCOPY_LOG_LOCATION"
 
           # Sparse checkout keeps the working tree tiny between slices
-          git sparse-checkout init --cone || true
-          mkdir -p __keep__ && : > __keep__/.keep
-          git sparse-checkout set __keep__
+          git -C "$REPO_ROOT" sparse-checkout init --cone || true
+          mkdir -p "$REPO_ROOT/__keep__" && : > "$REPO_ROOT/__keep__/.keep"
+          git -C "$REPO_ROOT" sparse-checkout set __keep__
 
           # Helper: add+commit+push only if changes exist
           commit_if_needed () {
             local what="$1"
-            if ! git diff --cached --quiet -- .; then
-              git commit -m "Sync slice: ${what} - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-              git push
+            if ! git -C "$REPO_ROOT" diff --cached --quiet -- .; then
+              git -C "$REPO_ROOT" commit -m "Sync slice: ${what} - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+              git -C "$REPO_ROOT" push
             else
               echo "No changes for ${what}."
             fi
@@ -89,15 +90,14 @@ jobs:
 
           # Move one directory or a list of files, commit, then shrink again
           process_slice () {
-            local src_root="$1"   # e.g. /mnt/aztmp/root
+            local src_root="$1"   # e.g. /mnt/aztmp/root.XXXX
             local rels_file="$2"  # newline-separated relative paths from src_root
-            local target_prefix="$3" # repo dir prefix like "." or "./foo"
+            local target_prefix="$3" # "." or "./foo"
 
             mapfile -t rels < "$rels_file"
             [ "${#rels[@]}" -gt 0 ] || return 0
 
             # Expand sparse view to include these paths
-            # (list each path relative to repo root)
             patterns=( "__keep__" )
             for r in "${rels[@]}"; do
               if [ "$target_prefix" = "." ]; then
@@ -106,12 +106,12 @@ jobs:
                 patterns+=( "${target_prefix#./}/$r" )
               fi
             done
-            git sparse-checkout set -- "${patterns[@]}"
+            git -C "$REPO_ROOT" sparse-checkout set -- "${patterns[@]}"
 
-            # Copy the slice into the repo
+            # Copy the slice into the repo (absolute paths)
             for r in "${rels[@]}"; do
               src="$src_root/$r"
-              dst="$target_prefix/$r"
+              dst="$REPO_ROOT/$target_prefix/$r"
               mkdir -p "$(dirname "$dst")"
               if [ -d "$src" ]; then
                 rsync -a "$src"/ "$dst"/
@@ -120,13 +120,21 @@ jobs:
               fi
             done
 
-            # Stage & commit
-            git add -- "${rels[@]/#/${target_prefix%/.}/}"
+            # Stage & commit from repo root
+            to_add=()
+            for r in "${rels[@]}"; do
+              if [ "$target_prefix" = "." ]; then
+                to_add+=( "$r" )
+              else
+                to_add+=( "${target_prefix#./}/$r" )
+              fi
+            done
+            git -C "$REPO_ROOT" add -- "${to_add[@]}"
             commit_if_needed "${rels[0]} (+$(( ${#rels[@]} - 1 )) more)"
 
             # Drop slice from working tree to free space
-            git sparse-checkout set __keep__
-            git clean -fdx
+            git -C "$REPO_ROOT" sparse-checkout set __keep__
+            git -C "$REPO_ROOT" clean -fdx
 
             # Remove from temp
             for r in "${rels[@]}"; do
@@ -134,14 +142,12 @@ jobs:
             done
           }
 
-          # Turn space-separated PREFIXES into array (trim slashes)
+          # Turn space-separated PREFIXES into array (trim trailing slashes)
           read -r -a PXS <<< "$PREFIXES"
 
           for p in "${PXS[@]}"; do
             p="${p%/}"
-            if [ -z "$p" ] || [ "$p" = "/" ]; then
-              continue
-            fi
+            [ -z "$p" ] && continue
 
             if [ "$p" = "." ]; then
               SRC_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}"
@@ -163,12 +169,14 @@ jobs:
             set -e
             if [ $AC -ne 0 ]; then
               echo "::warning::AzCopy returned $AC for $LABEL (see logs in $AZCOPY_LOG_LOCATION)"
+              # Quick surfacing of any failures
+              if [ -d "$AZCOPY_LOG_LOCATION" ]; then
+                echo "Recent AzCopy errors for $LABEL:"
+                grep -R "ERROR:" -n "$AZCOPY_LOG_LOCATION" || true
+              fi
             fi
 
-            # Build immediate children list (dirs first, then files) from DEST_LOCAL
-            # and feed them in slices:
-            #  - each directory is its own slice
-            #  - top-level files are grouped in batches of up to 200
+            # Build immediate children list (dirs first, then files)
             pushd "$DEST_LOCAL" >/dev/null
 
             # process directories one by one
