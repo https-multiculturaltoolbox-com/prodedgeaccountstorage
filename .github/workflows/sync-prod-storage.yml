@@ -19,22 +19,37 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Download and commit per chunk (with cleanup)
+      - name: Download and commit per chunk (with cleanup, account key auth)
         env:
           PREFIXES: ${{ github.event.inputs.prefixes }}
           AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
         run: |
           set -euo pipefail
+      
+          # Use shared key auth for AzCopy
           export AZCOPY_ACCOUNT_KEY="$AZURE_STORAGE_KEY"
       
-          TMPROOT="$(mktemp -d)"; trap 'rm -rf "$TMPROOT"' EXIT
+          if [ -z "${PREFIXES:-}" ]; then
+            echo "::error::No prefixes provided."
+            exit 1
+          fi
+      
+          TMPROOT="$(mktemp -d)"
+          trap 'rm -rf "$TMPROOT"' EXIT
+      
           for p in $PREFIXES; do
             echo "==> Downloading prefix: $p"
             SRC_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}/${p}"
             DEST_LOCAL="${TMPROOT}/${p}"
+      
             mkdir -p "$DEST_LOCAL"
             azcopy copy "$SRC_URL" "$DEST_LOCAL" --recursive
-            mkdir -p "./$p"; rsync -a "$DEST_LOCAL"/ "./$p"/ || true
+      
+            echo "==> Copy into repo: $p"
+            mkdir -p "./$p"
+            rsync -a "$DEST_LOCAL"/ "./$p"/ || true
+      
+            echo "==> Commit & push for $p"
             git add "$p"
             if ! git diff --cached --quiet -- "$p"; then
               git commit -m "Sync from Azure (${p}) - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
@@ -42,5 +57,7 @@ jobs:
             else
               echo "No changes for $p."
             fi
+      
+            echo "==> Clean temp for $p"
             rm -rf "$DEST_LOCAL"
           done
