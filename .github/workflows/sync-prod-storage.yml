@@ -21,7 +21,18 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
+      - name: Debug list blobs for each prefix
+        env:
+          PREFIXES: ${{ github.event.inputs.prefixes }}
+          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+        run: |
+          set -euo pipefail
+          export AZCOPY_ACCOUNT_KEY="${AZURE_STORAGE_KEY}"
+          for p in $PREFIXES; do
+            echo "==> LISTING: $p"
+            azcopy list "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}/${p}" | sed -n '1,200p'
+            echo
+          done
       - name: Configure git author
         run: |
           git config user.name  "github-actions[bot]"
