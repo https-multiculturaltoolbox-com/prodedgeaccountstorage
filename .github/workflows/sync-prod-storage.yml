@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       prefixes:
-        description: "Space-separated prefixes (e.g., 'logs/2025-09-18/ images/'). Avoid '.' on large containers."
+        description: "Space-separated prefixes. Use '.' to sync the entire container."
         required: true
-        default: "logs/2025-09-18/"
+        default: "."
 
 permissions:
   contents: write
@@ -23,27 +23,32 @@ jobs:
         with:
           fetch-depth: 1
 
-      # Free space before big transfers
-      - name: Cleanup disk space before sync
+      - name: Configure git author
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Pre-clean disk (helps large syncs)
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc "/usr/local/share/boost" || true
           sudo docker system prune -af || true
           sudo apt-get clean || true
           df -h
 
-      - name: Configure git author
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
       - name: Install AzCopy (v10)
         run: |
-          set -e
           curl -sL https://aka.ms/downloadazcopy-v10-linux | tar -xz --strip-components=1
           sudo mv azcopy /usr/local/bin/azcopy
           azcopy --version
 
-      - name: Sync prefixes (commit → push → evict from disk)
+      - name: Ensure Azure CLI present
+        run: |
+          if ! command -v az >/dev/null 2>&1; then
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          fi
+          az version
+
+      - name: Sync (auto-chunk whole container)
         env:
           PREFIXES: ${{ github.event.inputs.prefixes }}
           AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
@@ -54,71 +59,159 @@ jobs:
           : "${AZURE_CONTAINER:?AZURE_CONTAINER missing}"
           : "${PREFIXES:?No prefixes provided}"
 
-          # Safety: syncing the entire container (".") will likely fill disk on shared runners
-          if [ "$PREFIXES" = "." ]; then
-            echo "::error::'.' (whole container) is not allowed on shared runners. Pass smaller prefixes (e.g., daily folders)."
-            exit 1
-          fi
-
-          # Tune & auth
           ulimit -n 65536 || true
+
+          # AzCopy auth & tuning
           export AZCOPY_ACCOUNT_KEY="${AZURE_STORAGE_KEY}"
           export AZCOPY_CONCURRENCY_VALUE=8
           export AZCOPY_LOG_LOCATION="$(pwd)/.azcopy-logs"
           mkdir -p "$AZCOPY_LOG_LOCATION"
 
-          # Keep only one folder in the working tree at a time
+          # Use sparse checkout so previous chunks don't sit in the worktree
           git sparse-checkout init --cone
 
-          TMPROOT="$(mktemp -d)"
-          trap 'rm -rf "$TMPROOT"' EXIT
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
 
-          for p in $PREFIXES; do
+          # Helper: push a single path (directory) that already exists locally
+          push_chunk () {
+            local PATH_IN_REPO="$1"
+            # Skip >95MB (avoid GitHub 100MB limit)
+            BIG=$(find "$PATH_IN_REPO" -type f -size +95M 2>/dev/null || true)
+            git add "$PATH_IN_REPO"
+            if [ -n "${BIG:-}" ]; then
+              echo "::warning::Skipping >95MB files under $PATH_IN_REPO"
+              echo "$BIG" | sed 's/^/ - /'
+              echo "$BIG" | xargs -r git reset -q
+            fi
+            if ! git diff --cached --quiet -- "$PATH_IN_REPO"; then
+              git commit -m "Sync from Azure ${PATH_IN_REPO} - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+              git push
+            else
+              echo "No changes in $PATH_IN_REPO"
+            fi
+            df -h
+          }
+
+          # When the user passed ".", discover top-level virtual folders and root files
+          generate_full_prefix_list () {
+            echo "Discovering top-level prefixes in container..."
+            # Top-level "directories"
+            TOPS=$(az storage blob list \
+              --account-name "$AZURE_STORAGE_ACCOUNT" \
+              --account-key "$AZURE_STORAGE_KEY" \
+              --container-name "$AZURE_CONTAINER" \
+              --delimiter "/" \
+              --num-results 5000 \
+              --query "blobPrefixes[].name" -o tsv || true)
+
+            # Root-level files (no '/')
+            ROOT=$(az storage blob list \
+              --account-name "$AZURE_STORAGE_ACCOUNT" \
+              --account-key "$AZURE_STORAGE_KEY" \
+              --container-name "$AZURE_CONTAINER" \
+              --num-results 5000 \
+              --query "[?contains(name, '/')==\`false\`].name" -o tsv || true)
+
+            # Emit prefixes (directories first)
+            if [ -n "${TOPS:-}" ]; then
+              echo "$TOPS"
+            fi
+
+            # For root files, emit a synthetic marker that we'll handle via include-path batches
+            if [ -n "${ROOT:-}" ]; then
+              echo "__ROOT__"
+              # Save root list for batching
+              printf "%s\n" $ROOT > "$tmpdir/root-files.txt"
+            fi
+          }
+
+          # Build the list of chunks to process
+          CHUNKS=""
+          if [ "$PREFIXES" = "." ]; then
+            CHUNKS="$(generate_full_prefix_list)"
+            if [ -z "$CHUNKS" ]; then
+              echo "::warning::No prefixes or root files discovered; nothing to sync."
+              exit 0
+            fi
+          else
+            CHUNKS="$PREFIXES"
+          fi
+
+          # Process each chunk
+          for p in $CHUNKS; do
+            if [ "$p" = "__ROOT__" ]; then
+              echo "==> Processing ROOT files in batches"
+              git sparse-checkout set .
+              SRC_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}"
+
+              # Batch root files into groups of 500 (adjust if needed)
+              BATCH_SIZE=500
+              mapfile -t ROOTFILES < "$tmpdir/root-files.txt" || true
+              total=${#ROOTFILES[@]}
+              if [ "$total" -eq 0 ]; then
+                echo "No root files."
+              else
+                i=0
+                while [ $i -lt $total ]; do
+                  batch=( "${ROOTFILES[@]:$i:$BATCH_SIZE}" )
+                  i=$(( i + BATCH_SIZE ))
+
+                  # Prepare include-path CSV (relative to container root)
+                  inc="$(printf "%s," "${batch[@]}")"
+                  inc="${inc%,}"
+
+                  dest="$tmpdir/__root_batch__$i"
+                  mkdir -p "$dest"
+
+                  echo "   - Downloading ROOT batch ending at index $i (size ${#batch[@]})"
+                  set +e
+                  azcopy copy "$SRC_URL" "$dest" --recursive=false --include-path "$inc" --log-level INFO
+                  AC_STATUS=$?
+                  set -e
+
+                  # Copy into repo root
+                  rsync -a "$dest"/ "./" || true
+                  push_chunk "."
+
+                  # Evict files from worktree (keep repo metadata)
+                  git sparse-checkout set "" || true
+                  rm -rf "$dest"
+
+                  if [ "$AC_STATUS" -ne 0 ]; then
+                    echo "::warning::AzCopy had errors in a ROOT batch; continuing."
+                    tail -n 100 "$(ls -t .azcopy-logs/*.log | head -n1)" || true
+                  fi
+                done
+              fi
+              continue
+            fi
+
             echo "==> Processing prefix: $p"
-
-            # Evict everything except this prefix from the worktree (frees disk without committing deletions)
             git sparse-checkout set "$p"
 
             SRC_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}/${p}"
-            DEST_LOCAL="${TMPROOT}/${p}"
+            DEST_LOCAL="${tmpdir}/${p}"
             TARGET_DIR="./$p"
 
             mkdir -p "$DEST_LOCAL" "$TARGET_DIR"
 
-            # Download this chunk
             set +e
             azcopy copy "$SRC_URL" "$DEST_LOCAL" --recursive --log-level INFO
             AC_STATUS=$?
             set -e
 
-            # Copy into repo
             rsync -a "$DEST_LOCAL"/ "$TARGET_DIR"/ || true
+            push_chunk "$TARGET_DIR"
 
-            # Stage and avoid >95MB files (GitHub hard-limit ~100MB)
-            BIG=$(find "$TARGET_DIR" -type f -size +95M 2>/dev/null || true)
-            git add "$TARGET_DIR"
-            if [ -n "$BIG" ]; then
-              echo "::warning::Skipping files >95MB in $p:"
-              echo "$BIG" | sed 's/^/ - /'
-              echo "$BIG" | xargs -r git reset -q
-            fi
-
-            if ! git diff --cached --quiet -- "$TARGET_DIR"; then
-              git commit -m "Sync from Azure ${p} - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-              git push
-            else
-              echo "No changes for ${p}."
-            fi
-
-            # Clean temp and show remaining space
+            # Evict from worktree to free space
+            git sparse-checkout set "" || true
             rm -rf "$DEST_LOCAL"
-            df -h
 
-            # Warn (don’t fail) on AzCopy issues to let later prefixes proceed
             if [ "$AC_STATUS" -ne 0 ]; then
-              echo "::warning::AzCopy returned exit $AC_STATUS for ${p}. See logs in $AZCOPY_LOG_LOCATION"
+              echo "::warning::AzCopy returned exit $AC_STATUS for $p; see logs in $AZCOPY_LOG_LOCATION"
               tail -n 100 "$(ls -t .azcopy-logs/*.log | head -n1)" || true
             fi
           done
 
-          echo "Done. Only the last processed prefix remains in the workspace."
+          echo "All requested chunks processed."
