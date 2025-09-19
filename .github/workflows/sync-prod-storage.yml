@@ -1,4 +1,4 @@
-name: Sync prodedgeaccountstorage to repo (1GB commits)
+name: Sync prodedgeaccountstorage to repo (1GB commits, no git in container)
 
 on:
   schedule:
@@ -7,6 +7,9 @@ on:
 
 permissions:
   contents: write
+
+env:
+  COMMIT_BYTES: "1073741824"   # 1 GB
 
 jobs:
   sync:
@@ -23,141 +26,138 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY" || true
           df -h
 
-      - name: Sync via Azure CLI (install git inside container)
+      - name: Download changed blobs (Azure CLI only — no git here)
         uses: azure/CLI@v2
         env:
           AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
           AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
-          COMMIT_BYTES: "1073741824"   # 1 GB
         with:
           azcliversion: 2.63.0
           inlineScript: |
-            set -euo pipefail
-            shopt -s extglob nullglob
-
-            # --- ensure we're operating inside the checked-out repo ---
-            cd "$GITHUB_WORKSPACE"
-            git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-            # --- Ensure git & bash available inside the container ---
-            if command -v apk >/dev/null 2>&1; then
-              apk add --no-cache git bash coreutils findutils gawk grep sed
-            elif command -v apt-get >/dev/null 2>&1; then
-              apt-get update -y
-              apt-get install -y git bash coreutils findutils gawk
-            elif command -v microdnf >/dev/null 2>&1; then
-              microdnf install -y git bash findutils gawk
-            fi
-            git --version
-            bash --version | head -n1
+            set -eu
 
             ROOT="azure/prodedgeaccountstorage"
             MANIFEST_DIR=".sync-manifest"
+            PENDING="$MANIFEST_DIR/_pending.txt"
+
             mkdir -p "$ROOT" "$MANIFEST_DIR"
+            : > "$PENDING"   # clear list of newly-downloaded files
 
             echo "Listing containers in: $AZURE_STORAGE_ACCOUNT"
-            mapfile -t CONTAINERS < <(az storage container list \
+            az storage container list \
               --account-name "$AZURE_STORAGE_ACCOUNT" \
               --account-key "$AZURE_STORAGE_KEY" \
-              --query "[].name" -o tsv)
+              --query "[].name" -o tsv | while IFS= read -r c; do
+                [ -z "$c" ] && continue
+                echo "::group::Container $c"
+                TARGET="$ROOT/$c"
+                MANIFEST="$MANIFEST_DIR/$c.tsv"
+                mkdir -p "$TARGET"
+                [ -f "$MANIFEST" ] || : > "$MANIFEST"
 
-            echo "Found containers: ${CONTAINERS[*]:-<none>}"
+                # Enumerate remote blobs: name, etag, size
+                az storage blob list \
+                  --account-name "$AZURE_STORAGE_ACCOUNT" \
+                  --account-key "$AZURE_STORAGE_KEY" \
+                  --container-name "$c" \
+                  --query "[].{name:name,etag:properties.etag,size:properties.contentLength}" \
+                  -o tsv | while IFS=$'\t' read -r name etag size; do
+                      [ -z "$name" ] && continue
+                      # Lookup existing etag by blob name in manifest (format: etag<TAB>name)
+                      existing_etag="$(awk -F'\t' -v n="$name" '$2==n {print $1; exit}' "$MANIFEST" 2>/dev/null || true)"
+                      if [ "$existing_etag" = "$etag" ]; then
+                        # Up-to-date; skip
+                        continue
+                      fi
 
-            # --- Git config & sparse checkout (keep workspace minimal) ---
-            git config user.name  "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git sparse-checkout init --cone || true
-            git sparse-checkout set ".github" "$ROOT" "$MANIFEST_DIR" || true
+                      # Ensure local subdir exists
+                      dirp="$(dirname "$TARGET/$name")"
+                      [ -d "$dirp" ] || mkdir -p "$dirp"
 
-            commit_chunk () {
-              local label="$1"
-              if [[ -n "$(git status --porcelain)" ]]; then
-                git add "$ROOT" "$MANIFEST_DIR"
-                git commit -m "$label ($(date -u +'%Y-%m-%d %H:%M:%S UTC'))"
-                git push
-              fi
-            }
+                      # Download single blob
+                      az storage blob download \
+                        --account-name "$AZURE_STORAGE_ACCOUNT" \
+                        --account-key "$AZURE_STORAGE_KEY" \
+                        --container-name "$c" \
+                        --name "$name" \
+                        --file "$TARGET/$name" \
+                        --overwrite \
+                        --no-progress 1>/dev/null
 
-            # Process containers one by one
-            for c in "${CONTAINERS[@]}"; do
-              echo "::group::Container $c"
-              TARGET="$ROOT/$c"
-              MANIFEST="$MANIFEST_DIR/$c.tsv"
-              mkdir -p "$TARGET"
-              touch "$MANIFEST"
+                      # Update manifest: remove old line for this name, then append new etag+name
+                      tmpmf="$MANIFEST.tmp"
+                      awk -F'\t' -v n="$name" '!(NF>=2 && $2==n)' "$MANIFEST" > "$tmpmf" 2>/dev/null || true
+                      printf "%s\t%s\n" "$etag" "$name" >> "$tmpmf"
+                      mv "$tmpmf" "$MANIFEST"
 
-              # Narrow working tree to this container + manifests
-              git sparse-checkout set ".github" "$TARGET" "$MANIFEST_DIR"
+                      # Record downloaded path to be committed later
+                      printf "%s\n" "$TARGET/$name" >> "$PENDING"
+                  done
 
-              # Load existing manifest: "etag<TAB>name"
-              declare -A SEEN=()
-              while IFS=$'\t' read -r etag name; do
-                [[ -z "${etag:-}" || -z "${name:-}" ]] && continue
-                SEEN["$name"]="$etag"
-              done < <(cat "$MANIFEST" || true)
+                echo "::endgroup::"
+              done
 
-              bytes_since_commit=0
-              downloaded_any=false
+            echo "Pending file list written to $PENDING"
+            echo "Summary: $(wc -l < "$PENDING" | tr -d ' ') files downloaded."
 
-              echo "Enumerating blobs for $c ..."
-              # Get name, etag, size for each blob
-              az storage blob list \
-                --account-name "$AZURE_STORAGE_ACCOUNT" \
-                --account-key "$AZURE_STORAGE_KEY" \
-                --container-name "$c" \
-                --query "[].{name:name,etag:properties.etag,size:properties.contentLength}" \
-                -o tsv | while IFS=$'\t' read -r name etag size; do
-                  # Skip if unchanged vs manifest
-                  if [[ "${SEEN[$name]:-}" == "$etag" ]]; then
-                    continue
-                  fi
+      - name: Commit & push in ~1GB chunks (host VM)
+        if: always()
+        run: |
+          set -euo pipefail
+          ROOT="azure/prodedgeaccountstorage"
+          MANIFEST_DIR=".sync-manifest"
+          PENDING="$MANIFEST_DIR/_pending.txt"
+          THRESH=${COMMIT_BYTES:-1073741824}
 
-                  mkdir -p "$(dirname "$TARGET/$name")"
+          if [ ! -s "$PENDING" ]; then
+            echo "No new/changed files to commit."
+            exit 0
+          fi
 
-                  # Download a single blob
-                  az storage blob download \
-                    --account-name "$AZURE_STORAGE_ACCOUNT" \
-                    --account-key "$AZURE_STORAGE_KEY" \
-                    --container-name "$c" \
-                    --name "$name" \
-                    --file "$TARGET/$name" \
-                    --overwrite \
-                    --no-progress 1>/dev/null
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-                  # Update manifest: remove old line for name, then write new etag+name
-                  tmpmf="$MANIFEST.tmp"
-                  awk -v n="$name" -F'\t' '!(NF>=2 && $2==n)' "$MANIFEST" > "$tmpmf" || true
-                  printf "%s\t%s\n" "$etag" "$name" >> "$tmpmf"
-                  mv "$tmpmf" "$MANIFEST"
+          bytes=0
+          count=0
+          chunk=1
 
-                  downloaded_any=true
-                  bytes_since_commit=$(( bytes_since_commit + size ))
+          commit_chunk () {
+            local label="$1"
+            if [ -n "$(git status --porcelain)" ]; then
+              git commit -m "$label ($(date -u +'%Y-%m-%d %H:%M:%S UTC'))"
+              git push
+            fi
+          }
 
-                  # Stage as we go
-                  git add "$TARGET/$name" "$MANIFEST"
+          # Add files one-by-one until we reach ~1GB; then commit and continue.
+          while IFS= read -r path; do
+            [ -f "$path" ] || continue
+            sz=$(stat -c %s "$path")
+            git add -- "$path"
+            count=$((count+1))
+            bytes=$((bytes+sz))
+            # Stage manifest only on the first chunk so it lands once
+            if [ "$chunk" -eq 1 ]; then
+              git add -- "$MANIFEST_DIR"
+            fi
 
-                  # Commit and reset counter when reaching threshold
-                  if (( bytes_since_commit >= COMMIT_BYTES )); then
-                    mb=$(( bytes_since_commit/1024/1024 ))
-                    commit_chunk "Sync '$c' (chunk ~${mb} MB)"
-                    bytes_since_commit=0
-                    git clean -fdx
-                    df -h || true
-                  fi
-                done
+            if [ "$bytes" -ge "$THRESH" ]; then
+              mb=$((bytes/1024/1024))
+              commit_chunk "Sync (chunk $chunk ~${mb} MB)"
+              bytes=0
+              chunk=$((chunk+1))
+            fi
+          done < "$PENDING"
 
-              # Final commit for this container if anything changed
-              if [[ "$downloaded_any" == true ]]; then
-                commit_chunk "Sync '$c' (final)"
-              else
-                echo "No changes for $c."
-              fi
+          # Final commit for remaining files
+          if [ "$bytes" -gt 0 ] || [ "$chunk" -eq 1 ]; then
+            mb=$(( (bytes>0?bytes:0)/1024/1024 ))
+            commit_chunk "Sync (final chunk ~${mb} MB)"
+          fi
 
-              # Clean between containers to keep disk low
-              git clean -fdx
-              df -h || true
-              echo "::endgroup::"
-            done
+          # Clean up the pending list
+          : > "$PENDING"
 
       - name: Final df -h
         run: df -h
