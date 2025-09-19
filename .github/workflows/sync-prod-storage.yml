@@ -21,18 +21,58 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-      - name: Debug list blobs for each prefix
+      - name: Download and commit per chunk (account key auth + root fallback)
         env:
           PREFIXES: ${{ github.event.inputs.prefixes }}
           AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
         run: |
           set -euo pipefail
+          : "${AZURE_STORAGE_KEY:?AZURE_STORAGE_KEY missing}"
+          : "${AZURE_STORAGE_ACCOUNT:?AZURE_STORAGE_ACCOUNT missing}"
+          : "${AZURE_CONTAINER:?AZURE_CONTAINER missing}"
+          : "${PREFIXES:?No prefixes provided}"
+      
           export AZCOPY_ACCOUNT_KEY="${AZURE_STORAGE_KEY}"
+          export AZCOPY_LOG_LOCATION="$(pwd)/.azcopy-logs"
+      
+          TMPROOT="$(mktemp -d)"
+          trap 'rm -rf "$TMPROOT"' EXIT
+      
           for p in $PREFIXES; do
-            echo "==> LIST $p"
-            azcopy list "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}/${p}" | sed -n '1,200p' || true
-            echo
+            if [ "$p" = "." ] || [ "$p" = "/" ] || [ -z "$p" ]; then
+              SRC_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}"
+              TARGET_DIR="."
+              LABEL="(root)"
+              DEST_LOCAL="${TMPROOT}/root"
+            else
+              SRC_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}/${p}"
+              TARGET_DIR="./$p"
+              LABEL="$p"
+              DEST_LOCAL="${TMPROOT}/${p}"
+            fi
+      
+            echo "==> Downloading: $LABEL"
+            mkdir -p "$DEST_LOCAL"
+            azcopy copy "$SRC_URL" "$DEST_LOCAL" --recursive --log-level INFO
+      
+            echo "==> Copy into repo: $LABEL"
+            mkdir -p "$TARGET_DIR"
+            rsync -a "$DEST_LOCAL"/ "$TARGET_DIR"/ || true
+      
+            echo "==> Commit & push for $LABEL"
+            git add "$TARGET_DIR"
+            if ! git diff --cached --quiet -- "$TARGET_DIR"; then
+              git commit -m "Sync from Azure ${LABEL} - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+              git push
+            else
+              echo "No changes for ${LABEL}."
+            fi
+      
+            echo "==> Clean temp for $LABEL"
+            rm -rf "$DEST_LOCAL"
           done
+      
+          echo "AzCopy logs at: $AZCOPY_LOG_LOCATION"
       - name: Configure git author
         run: |
           git config user.name  "github-actions[bot]"
