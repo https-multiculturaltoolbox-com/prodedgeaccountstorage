@@ -3,21 +3,22 @@ name: Sync Azure Blobs to Repo
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 2 * * *"  # 02:00 UTC daily (adjust as needed)
+    - cron: "0 2 * * *" # 02:00 UTC daily
   push:
     paths:
       - .github/workflows/azure-blob-sync.yml
 
 permissions:
-  contents: write   # needed to push commits
+  contents: write
 
 env:
   ROOT_DIR: azure
   MANIFEST_DIR: .sync-manifest
   PENDING_LIST: .sync-manifest/_pending.txt
-  COMMIT_BYTES: 1073741824     # 1 GiB cap per commit (tune as needed)
+  COMMIT_BYTES: 1073741824        # 1 GiB per commit
   COMMIT_AUTHOR_NAME: azure-sync-bot
   COMMIT_AUTHOR_EMAIL: noreply@example.com
+  # Set to a fixed branch like "main" if you want to always push there
   COMMIT_BRANCH: ${{ github.ref_name }}
 
 jobs:
@@ -25,21 +26,30 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Verify secrets present
+      - name: Validate secrets / tokens
         shell: bash
         run: |
           set -euo pipefail
-          : "${AZURE_STORAGE_ACCOUNT:?AZURE_STORAGE_ACCOUNT secret is missing}"
-          : "${AZURE_STORAGE_KEY:?AZURE_STORAGE_KEY secret is missing}"
+          # You can use either a SAS token (preferred) or an Account Key.
+          if [ -z "${{ secrets.AZURE_STORAGE_SAS_TOKEN || '' }}" ] && [ -z "${{ secrets.AZURE_STORAGE_KEY || '' }}" ]; then
+            echo "ERROR: Provide either AZURE_STORAGE_SAS_TOKEN or AZURE_STORAGE_KEY in repo Settings → Secrets → Actions."
+            exit 1
+          fi
+          : "${{ secrets.AZURE_STORAGE_ACCOUNT || '' }}"
+          if [ -z "${{ secrets.AZURE_STORAGE_ACCOUNT || '' }}" ]; then
+            echo "ERROR: AZURE_STORAGE_ACCOUNT secret is missing."
+            exit 1
+          fi
 
       - name: Azure CLI (download + manifest)
         uses: azure/CLI@v2
         with:
+          # 2.63.0 is the last Alpine image; you may omit to use latest Azure Linux image
           azcliversion: 2.63.0
           inlineScript: |
             set -euo pipefail
@@ -51,7 +61,17 @@ jobs:
             mkdir -p "$ROOT" "$MANIFEST_DIR"
             : > "$PENDING"
 
-            echo "Listing containers in: $AZURE_STORAGE_ACCOUNT"
+            # Build auth args: prefer SAS over account key
+            AUTH_ARGS=(
+              --account-name "${AZURE_STORAGE_ACCOUNT}"
+            )
+            if [ -n "${AZURE_STORAGE_SAS_TOKEN:-}" ]; then
+              AUTH_ARGS+=( --sas-token "${AZURE_STORAGE_SAS_TOKEN}" )
+            else
+              AUTH_ARGS+=( --account-key "${AZURE_STORAGE_KEY}" )
+            fi
+
+            echo "Listing containers in: ${AZURE_STORAGE_ACCOUNT}"
 
             # --- Containers pagination loop ---
             container_marker=""
@@ -59,17 +79,14 @@ jobs:
               mapfile -t containers < <(
                 az storage container list \
                   --only-show-errors \
-                  --account-name "$AZURE_STORAGE_ACCOUNT" \
-                  --account-key "$AZURE_STORAGE_KEY" \
+                  "${AUTH_ARGS[@]}" \
                   ${container_marker:+--marker "$container_marker"} \
                   --query "[].name" -o tsv
               )
 
-              # Get next marker (empty when done)
               container_marker="$(az storage container list \
                   --only-show-errors \
-                  --account-name "$AZURE_STORAGE_ACCOUNT" \
-                  --account-key "$AZURE_STORAGE_KEY" \
+                  "${AUTH_ARGS[@]}" \
                   ${container_marker:+--marker "$container_marker"} \
                   --query "nextMarker" -o tsv || true)"
 
@@ -84,61 +101,48 @@ jobs:
                 # --- Blobs pagination loop ---
                 blob_marker=""
                 while :; do
-                  # Parse TSV rows: name, etag, size
                   while IFS=$'\t' read -r name etag size || [ -n "${name-}" ]; do
-                    # Trim \r just in case
                     name="${name%$'\r'}"; etag="${etag%$'\r'}"; size="${size%$'\r'}"
-                    # Skip malformed/empty lines
                     if [ -z "${name:-}" ] || [ -z "${etag:-}" ]; then
                       continue
                     fi
 
-                    # Check current etag in manifest
                     existing_etag="$(awk -F'\t' -v n="$name" '$2==n {print $1; exit}' "$MANIFEST" 2>/dev/null || true)"
                     if [ "$existing_etag" = "$etag" ]; then
-                      # Up-to-date
                       continue
                     fi
 
-                    # Ensure subdir exists
                     dirp="$(dirname "$TARGET/$name")"
                     [ -d "$dirp" ] || mkdir -p "$dirp"
 
-                    # Download the blob
                     az storage blob download \
                       --only-show-errors \
-                      --account-name "$AZURE_STORAGE_ACCOUNT" \
-                      --account-key "$AZURE_STORAGE_KEY" \
+                      "${AUTH_ARGS[@]}" \
                       --container-name "$c" \
                       --name "$name" \
                       --file "$TARGET/$name" \
                       --overwrite \
                       --no-progress 1>/dev/null
 
-                    # Update manifest (etag<TAB>name)
                     tmpmf="$MANIFEST.tmp"
                     awk -F'\t' -v n="$name" '!(NF>=2 && $2==n)' "$MANIFEST" > "$tmpmf" 2>/dev/null || true
                     printf "%s\t%s\n" "$etag" "$name" >> "$tmpmf"
                     mv "$tmpmf" "$MANIFEST"
 
-                    # Record for commit
                     printf "%s\n" "$TARGET/$name" >> "$PENDING"
                   done < <(
                     az storage blob list \
                       --only-show-errors \
-                      --account-name "$AZURE_STORAGE_ACCOUNT" \
-                      --account-key "$AZURE_STORAGE_KEY" \
+                      "${AUTH_ARGS[@]}" \
                       --container-name "$c" \
                       ${blob_marker:+--marker "$blob_marker"} \
                       --query "[].{name:name,etag:properties.etag,size:properties.contentLength}" \
                       -o tsv
                   )
 
-                  # Next page of blobs?
                   blob_marker="$(az storage blob list \
                       --only-show-errors \
-                      --account-name "$AZURE_STORAGE_ACCOUNT" \
-                      --account-key "$AZURE_STORAGE_KEY" \
+                      "${AUTH_ARGS[@]}" \
                       --container-name "$c" \
                       ${blob_marker:+--marker "$blob_marker"} \
                       --query 'nextMarker' -o tsv || true)"
@@ -153,10 +157,10 @@ jobs:
 
             echo "Pending file list written to $PENDING"
             echo "Summary: $(wc -l < "$PENDING" | tr -d ' ') files downloaded."
-
         env:
           AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
           AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+          AZURE_STORAGE_SAS_TOKEN: ${{ secrets.AZURE_STORAGE_SAS_TOKEN }} # optional; if set, preferred
           ROOT_DIR: ${{ env.ROOT_DIR }}
           MANIFEST_DIR: ${{ env.MANIFEST_DIR }}
           PENDING_LIST: ${{ env.PENDING_LIST }}
@@ -181,9 +185,8 @@ jobs:
             [ "${#batch[@]}" -gt 0 ] || return 0
             echo "Committing ${#batch[@]} files (~${batch_bytes} bytes)"
             git add "${batch[@]}" "${MANIFEST_DIR}"/*.tsv
-            # Skip empty commit if manifests only changed without content?
             if ! git diff --cached --quiet; then
-              git commit -m "Sync Azure blobs (batch, cap=${COMMIT_BYTES} bytes)"
+              git commit -m "Sync Azure blobs (batch ≤ ${COMMIT_BYTES} bytes)"
               git push origin "${COMMIT_BRANCH}"
             else
               echo "No staged changes; skipping commit."
@@ -194,9 +197,7 @@ jobs:
 
           while IFS= read -r f; do
             [ -f "$f" ] || continue
-            # GNU stat on ubuntu-latest:
             sz=$(stat -c%s "$f" || echo 0)
-            # If single file > threshold, still commit it alone
             if [ "$((batch_bytes + sz))" -gt "$threshold" ] && [ "${#batch[@]}" -gt 0 ]; then
               commit_batch
             fi
@@ -204,7 +205,6 @@ jobs:
             batch_bytes=$((batch_bytes + sz))
           done < "$PENDING"
 
-          # Final batch
           commit_batch
 
       - name: Workflow summary
