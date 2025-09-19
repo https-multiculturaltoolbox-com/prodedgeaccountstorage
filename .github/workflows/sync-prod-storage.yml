@@ -19,20 +19,32 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Download and commit per chunk (with cleanup, account key auth)
+      - name: Download and commit per chunk (account key auth)
         env:
           PREFIXES: ${{ github.event.inputs.prefixes }}
           AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
         run: |
           set -euo pipefail
       
-          # Use shared key auth for AzCopy
-          export AZCOPY_ACCOUNT_KEY="$AZURE_STORAGE_KEY"
-      
+          # 0) Sanity checks
+          if [ -z "${AZURE_STORAGE_KEY:-}" ]; then
+            echo "::error::AZURE_STORAGE_KEY secret is missing."
+            exit 1
+          fi
+          if [ -z "${AZURE_STORAGE_ACCOUNT:-}" ] || [ -z "${AZURE_CONTAINER:-}" ]; then
+            echo "::error::AZURE_STORAGE_ACCOUNT or AZURE_CONTAINER not set."
+            exit 1
+          fi
           if [ -z "${PREFIXES:-}" ]; then
             echo "::error::No prefixes provided."
             exit 1
           fi
+      
+          # 1) Tell AzCopy to use the shared key (NO SAS needed in URL)
+          export AZCOPY_ACCOUNT_KEY="${AZURE_STORAGE_KEY}"
+      
+          # Optional: write logs to a known path for debugging
+          export AZCOPY_LOG_LOCATION="$(pwd)/.azcopy-logs"
       
           TMPROOT="$(mktemp -d)"
           trap 'rm -rf "$TMPROOT"' EXIT
@@ -41,9 +53,10 @@ jobs:
             echo "==> Downloading prefix: $p"
             SRC_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}/${p}"
             DEST_LOCAL="${TMPROOT}/${p}"
-      
             mkdir -p "$DEST_LOCAL"
-            azcopy copy "$SRC_URL" "$DEST_LOCAL" --recursive
+      
+            # Use account-key auth (URL has no SAS)
+            azcopy copy "$SRC_URL" "$DEST_LOCAL" --recursive --log-level INFO
       
             echo "==> Copy into repo: $p"
             mkdir -p "./$p"
@@ -60,4 +73,6 @@ jobs:
       
             echo "==> Clean temp for $p"
             rm -rf "$DEST_LOCAL"
-          done
+    done
+
+    echo "AzCopy logs at: $AZCOPY_LOG_LOCATION"
