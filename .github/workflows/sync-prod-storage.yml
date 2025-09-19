@@ -1,53 +1,79 @@
-name: Sync prodedgeaccountstorage to repo (1GB commits, no git in container)
+name: Sync Azure Blobs to Repo
 
 on:
-  schedule:
-    - cron: "0 2 * * *"   # daily 02:00 UTC
   workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"  # 02:00 UTC daily (adjust as needed)
+  push:
+    paths:
+      - .github/workflows/azure-blob-sync.yml
 
 permissions:
-  contents: write
+  contents: write   # needed to push commits
 
 env:
-  COMMIT_BYTES: "1073741824"   # 1 GB
+  ROOT_DIR: azure
+  MANIFEST_DIR: .sync-manifest
+  PENDING_LIST: .sync-manifest/_pending.txt
+  COMMIT_BYTES: 1073741824     # 1 GiB cap per commit (tune as needed)
+  COMMIT_AUTHOR_NAME: azure-sync-bot
+  COMMIT_AUTHOR_EMAIL: noreply@example.com
+  COMMIT_BRANCH: ${{ github.ref_name }}
 
 jobs:
   sync:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout (shallow)
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
-      - name: Free up disk space
+      - name: Verify secrets present
+        shell: bash
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY" || true
-          df -h
+          set -euo pipefail
+          : "${AZURE_STORAGE_ACCOUNT:?AZURE_STORAGE_ACCOUNT secret is missing}"
+          : "${AZURE_STORAGE_KEY:?AZURE_STORAGE_KEY secret is missing}"
 
-      - name: Download changed blobs (Azure CLI only — no git here)
+      - name: Azure CLI (download + manifest)
         uses: azure/CLI@v2
-        env:
-          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
-          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
         with:
           azcliversion: 2.63.0
           inlineScript: |
-            set -eu
+            set -euo pipefail
 
-            ROOT="azure/prodedgeaccountstorage"
-            MANIFEST_DIR=".sync-manifest"
-            PENDING="$MANIFEST_DIR/_pending.txt"
+            ROOT="${ROOT_DIR}"
+            MANIFEST_DIR="${MANIFEST_DIR}"
+            PENDING="${PENDING_LIST}"
 
             mkdir -p "$ROOT" "$MANIFEST_DIR"
-            : > "$PENDING"   # clear list of newly-downloaded files
+            : > "$PENDING"
 
             echo "Listing containers in: $AZURE_STORAGE_ACCOUNT"
-            az storage container list \
-              --account-name "$AZURE_STORAGE_ACCOUNT" \
-              --account-key "$AZURE_STORAGE_KEY" \
-              --query "[].name" -o tsv | while IFS= read -r c; do
+
+            # --- Containers pagination loop ---
+            container_marker=""
+            while :; do
+              mapfile -t containers < <(
+                az storage container list \
+                  --only-show-errors \
+                  --account-name "$AZURE_STORAGE_ACCOUNT" \
+                  --account-key "$AZURE_STORAGE_KEY" \
+                  ${container_marker:+--marker "$container_marker"} \
+                  --query "[].name" -o tsv
+              )
+
+              # Get next marker (empty when done)
+              container_marker="$(az storage container list \
+                  --only-show-errors \
+                  --account-name "$AZURE_STORAGE_ACCOUNT" \
+                  --account-key "$AZURE_STORAGE_KEY" \
+                  ${container_marker:+--marker "$container_marker"} \
+                  --query "nextMarker" -o tsv || true)"
+
+              for c in "${containers[@]}"; do
                 [ -z "$c" ] && continue
                 echo "::group::Container $c"
                 TARGET="$ROOT/$c"
@@ -55,109 +81,133 @@ jobs:
                 mkdir -p "$TARGET"
                 [ -f "$MANIFEST" ] || : > "$MANIFEST"
 
-                # Enumerate remote blobs: name, etag, size
-                az storage blob list \
-                  --account-name "$AZURE_STORAGE_ACCOUNT" \
-                  --account-key "$AZURE_STORAGE_KEY" \
-                  --container-name "$c" \
-                  --query "[].{name:name,etag:properties.etag,size:properties.contentLength}" \
-                  -o tsv | while IFS=$'\t' read -r name etag size; do
-                      [ -z "$name" ] && continue
-                      # Lookup existing etag by blob name in manifest (format: etag<TAB>name)
-                      existing_etag="$(awk -F'\t' -v n="$name" '$2==n {print $1; exit}' "$MANIFEST" 2>/dev/null || true)"
-                      if [ "$existing_etag" = "$etag" ]; then
-                        # Up-to-date; skip
-                        continue
-                      fi
+                # --- Blobs pagination loop ---
+                blob_marker=""
+                while :; do
+                  # Parse TSV rows: name, etag, size
+                  while IFS=$'\t' read -r name etag size || [ -n "${name-}" ]; do
+                    # Trim \r just in case
+                    name="${name%$'\r'}"; etag="${etag%$'\r'}"; size="${size%$'\r'}"
+                    # Skip malformed/empty lines
+                    if [ -z "${name:-}" ] || [ -z "${etag:-}" ]; then
+                      continue
+                    fi
 
-                      # Ensure local subdir exists
-                      dirp="$(dirname "$TARGET/$name")"
-                      [ -d "$dirp" ] || mkdir -p "$dirp"
+                    # Check current etag in manifest
+                    existing_etag="$(awk -F'\t' -v n="$name" '$2==n {print $1; exit}' "$MANIFEST" 2>/dev/null || true)"
+                    if [ "$existing_etag" = "$etag" ]; then
+                      # Up-to-date
+                      continue
+                    fi
 
-                      # Download single blob
-                      az storage blob download \
-                        --account-name "$AZURE_STORAGE_ACCOUNT" \
-                        --account-key "$AZURE_STORAGE_KEY" \
-                        --container-name "$c" \
-                        --name "$name" \
-                        --file "$TARGET/$name" \
-                        --overwrite \
-                        --no-progress 1>/dev/null
+                    # Ensure subdir exists
+                    dirp="$(dirname "$TARGET/$name")"
+                    [ -d "$dirp" ] || mkdir -p "$dirp"
 
-                      # Update manifest: remove old line for this name, then append new etag+name
-                      tmpmf="$MANIFEST.tmp"
-                      awk -F'\t' -v n="$name" '!(NF>=2 && $2==n)' "$MANIFEST" > "$tmpmf" 2>/dev/null || true
-                      printf "%s\t%s\n" "$etag" "$name" >> "$tmpmf"
-                      mv "$tmpmf" "$MANIFEST"
+                    # Download the blob
+                    az storage blob download \
+                      --only-show-errors \
+                      --account-name "$AZURE_STORAGE_ACCOUNT" \
+                      --account-key "$AZURE_STORAGE_KEY" \
+                      --container-name "$c" \
+                      --name "$name" \
+                      --file "$TARGET/$name" \
+                      --overwrite \
+                      --no-progress 1>/dev/null
 
-                      # Record downloaded path to be committed later
-                      printf "%s\n" "$TARGET/$name" >> "$PENDING"
-                  done
+                    # Update manifest (etag<TAB>name)
+                    tmpmf="$MANIFEST.tmp"
+                    awk -F'\t' -v n="$name" '!(NF>=2 && $2==n)' "$MANIFEST" > "$tmpmf" 2>/dev/null || true
+                    printf "%s\t%s\n" "$etag" "$name" >> "$tmpmf"
+                    mv "$tmpmf" "$MANIFEST"
+
+                    # Record for commit
+                    printf "%s\n" "$TARGET/$name" >> "$PENDING"
+                  done < <(
+                    az storage blob list \
+                      --only-show-errors \
+                      --account-name "$AZURE_STORAGE_ACCOUNT" \
+                      --account-key "$AZURE_STORAGE_KEY" \
+                      --container-name "$c" \
+                      ${blob_marker:+--marker "$blob_marker"} \
+                      --query "[].{name:name,etag:properties.etag,size:properties.contentLength}" \
+                      -o tsv
+                  )
+
+                  # Next page of blobs?
+                  blob_marker="$(az storage blob list \
+                      --only-show-errors \
+                      --account-name "$AZURE_STORAGE_ACCOUNT" \
+                      --account-key "$AZURE_STORAGE_KEY" \
+                      --container-name "$c" \
+                      ${blob_marker:+--marker "$blob_marker"} \
+                      --query 'nextMarker' -o tsv || true)"
+                  [ -z "$blob_marker" ] && break
+                done
 
                 echo "::endgroup::"
               done
 
+              [ -z "$container_marker" ] && break
+            done
+
             echo "Pending file list written to $PENDING"
             echo "Summary: $(wc -l < "$PENDING" | tr -d ' ') files downloaded."
 
-      - name: Commit & push in ~1GB chunks (host VM)
-        if: always()
+        env:
+          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+          ROOT_DIR: ${{ env.ROOT_DIR }}
+          MANIFEST_DIR: ${{ env.MANIFEST_DIR }}
+          PENDING_LIST: ${{ env.PENDING_LIST }}
+
+      - name: Commit changes in size-capped batches
+        if: ${{ always() }}
+        shell: bash
         run: |
           set -euo pipefail
-          ROOT="azure/prodedgeaccountstorage"
-          MANIFEST_DIR=".sync-manifest"
-          PENDING="$MANIFEST_DIR/_pending.txt"
-          THRESH=${COMMIT_BYTES:-1073741824}
 
-          if [ ! -s "$PENDING" ]; then
-            echo "No new/changed files to commit."
-            exit 0
-          fi
+          git config user.name  "${COMMIT_AUTHOR_NAME}"
+          git config user.email "${COMMIT_AUTHOR_EMAIL}"
 
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          PENDING="${PENDING_LIST}"
+          [ -s "$PENDING" ] || { echo "Nothing to commit."; exit 0; }
 
-          bytes=0
-          count=0
-          chunk=1
+          threshold="${COMMIT_BYTES}"
+          batch_bytes=0
+          declare -a batch=()
 
-          commit_chunk () {
-            local label="$1"
-            if [ -n "$(git status --porcelain)" ]; then
-              git commit -m "$label ($(date -u +'%Y-%m-%d %H:%M:%S UTC'))"
-              git push
+          commit_batch() {
+            [ "${#batch[@]}" -gt 0 ] || return 0
+            echo "Committing ${#batch[@]} files (~${batch_bytes} bytes)"
+            git add "${batch[@]}" "${MANIFEST_DIR}"/*.tsv
+            # Skip empty commit if manifests only changed without content?
+            if ! git diff --cached --quiet; then
+              git commit -m "Sync Azure blobs (batch, cap=${COMMIT_BYTES} bytes)"
+              git push origin "${COMMIT_BRANCH}"
+            else
+              echo "No staged changes; skipping commit."
             fi
+            batch=()
+            batch_bytes=0
           }
 
-          # Add files one-by-one until we reach ~1GB; then commit and continue.
-          while IFS= read -r path; do
-            [ -f "$path" ] || continue
-            sz=$(stat -c %s "$path")
-            git add -- "$path"
-            count=$((count+1))
-            bytes=$((bytes+sz))
-            # Stage manifest only on the first chunk so it lands once
-            if [ "$chunk" -eq 1 ]; then
-              git add -- "$MANIFEST_DIR"
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            # GNU stat on ubuntu-latest:
+            sz=$(stat -c%s "$f" || echo 0)
+            # If single file > threshold, still commit it alone
+            if [ "$((batch_bytes + sz))" -gt "$threshold" ] && [ "${#batch[@]}" -gt 0 ]; then
+              commit_batch
             fi
-
-            if [ "$bytes" -ge "$THRESH" ]; then
-              mb=$((bytes/1024/1024))
-              commit_chunk "Sync (chunk $chunk ~${mb} MB)"
-              bytes=0
-              chunk=$((chunk+1))
-            fi
+            batch+=("$f")
+            batch_bytes=$((batch_bytes + sz))
           done < "$PENDING"
 
-          # Final commit for remaining files
-          if [ "$bytes" -gt 0 ] || [ "$chunk" -eq 1 ]; then
-            mb=$(( (bytes>0?bytes:0)/1024/1024 ))
-            commit_chunk "Sync (final chunk ~${mb} MB)"
-          fi
+          # Final batch
+          commit_batch
 
-          # Clean up the pending list
-          : > "$PENDING"
-
-      - name: Final df -h
-        run: df -h
+      - name: Workflow summary
+        if: ${{ always() }}
+        run: |
+          echo "Done. Check commit history for batches."
