@@ -1,0 +1,210 @@
+name: Sync Azure Blob → Repo (8GiB batched, push, then evict)
+
+on:
+  workflow_dispatch:
+    inputs:
+      prefixes:
+        description: "Space-separated prefixes (use '.' for whole container)"
+        required: true
+        default: "."
+      batch_gib:
+        description: "Batch size in GiB (approx per commit/push)"
+        required: true
+        default: "8"
+
+permissions:
+  contents: write
+
+env:
+  AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+  AZURE_CONTAINER:       ${{ secrets.AZURE_CONTAINER }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # quiet some advice noise
+          git config advice.updateSparsePath false || true
+
+      # Optional: free space on the system disk
+      - name: Cleanup disk space (optional but recommended)
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf "/usr/local/share/boost" || true
+          sudo apt-get clean || true
+          df -h
+
+      - name: Move repo to /mnt and prepare temp dirs
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /mnt/work /mnt/aztmp
+          sudo chown -R "$USER:$USER" /mnt/work /mnt/aztmp
+
+          rsync -a --delete "$GITHUB_WORKSPACE"/ /mnt/work/repo/
+
+          echo "REPO_DIR=/mnt/work/repo" >> "$GITHUB_ENV"
+          echo "AZTMP=/mnt/aztmp"        >> "$GITHUB_ENV"
+
+          df -h / /mnt || true
+
+      - name: Install AzCopy (v10)
+        run: |
+          set -euo pipefail
+          curl -sL https://aka.ms/downloadazcopy-v10-linux | tar -xz --strip-components=1
+          sudo mv azcopy /usr/local/bin/azcopy
+          azcopy --version
+
+      - name: Download, commit & push in ~8 GiB batches; evict after each push
+        env:
+          PREFIXES:          ${{ github.event.inputs.prefixes }}
+          BATCH_GIB:         ${{ github.event.inputs.batch_gib }}
+          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+        working-directory: ${{ env.REPO_DIR }}
+        run: |
+          set -euo pipefail
+
+          : "${AZURE_STORAGE_KEY:?AZURE_STORAGE_KEY missing}"
+          : "${AZURE_STORAGE_ACCOUNT:?AZURE_STORAGE_ACCOUNT missing}"
+          : "${AZURE_CONTAINER:?AZURE_CONTAINER missing}"
+          : "${PREFIXES:?No prefixes provided}"
+          : "${BATCH_GIB:?No batch size provided}"
+
+          # Use big /mnt for everything
+          ulimit -n 65536 || true
+          export TMPDIR="${AZTMP}"
+          export TEMP="${AZTMP}"
+          export TMP="${AZTMP}"
+
+          # AzCopy config on /mnt
+          export AZCOPY_ACCOUNT_KEY="${AZURE_STORAGE_KEY}"
+          export AZCOPY_CONCURRENCY_VALUE=8
+          export AZCOPY_LOG_LOCATION="${AZTMP}/azcopy-logs"
+          export AZCOPY_JOB_PLAN_LOCATION="${AZTMP}/azcopy-plan"
+          mkdir -p "$AZCOPY_LOG_LOCATION" "$AZCOPY_JOB_PLAN_LOCATION"
+
+          # Git: keep the worktree tiny between pushes (we’ll add outside-sparse paths with `--sparse`)
+          git sparse-checkout init --no-cone || true
+          # an empty/near-empty worktree is fine; pattern that matches nothing
+          git sparse-checkout set --no-cone "/__keep__" || true
+
+          BATCH_BYTES=$(( BATCH_GIB * 1024 * 1024 * 1024 ))
+          echo "Batch size target: ~${BATCH_GIB} GiB (${BATCH_BYTES} bytes)"
+
+          warn() { echo "::warning::$*"; }
+
+          move_batch_and_push() {
+            local STAGE_DIR="$1"   # absolute stage dir under /mnt/aztmp
+            local TARGET_DIR="$2"  # repo-relative target (e.g., "." or "./prefix")
+            local LABEL="$3"
+
+            mkdir -p "$TARGET_DIR"
+
+            local ACC=0
+            local count=0
+            local rel size
+
+            # Build a batch list deterministically by path
+            # If the very first file exceeds BATCH_BYTES, we still take it.
+            while IFS=$'\t' read -r -d '' rel size; do
+              # ensure destination directory exists
+              mkdir -p "$TARGET_DIR/$(dirname "$rel")"
+              mv -f "$STAGE_DIR/$rel" "$TARGET_DIR/$rel"
+              ACC=$((ACC + size))
+              count=$((count + 1))
+              if [ "$ACC" -ge "$BATCH_BYTES" ]; then
+                break
+              fi
+            done < <(find "$STAGE_DIR" -type f -printf '%P\t%s\0' | sort -z)
+
+            if [ "$count" -eq 0 ]; then
+              return 1
+            fi
+
+            echo "Moved $count files (~$(numfmt --to=iec "$ACC")) from stage → repo for ${LABEL}"
+
+            # Stage & commit only what we just moved (even though it’s outside sparse patterns)
+            git add --sparse "$TARGET_DIR"
+            if ! git diff --cached --quiet -- "$TARGET_DIR"; then
+              git commit -m "Sync ${LABEL}: ~$(numfmt --to=iec "$ACC") @ $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+              git push
+            else
+              echo "No changes detected for ${LABEL} in this batch."
+            fi
+
+            # Evict everything not in sparse patterns to free disk **without** a deletion commit
+            git sparse-checkout reapply || true
+            # Also drop any remaining untracked junk
+            git clean -fdx || true
+
+            # Keep the repo lean
+            git gc --prune=now || true
+
+            df -h "$PWD" /mnt || true
+            return 0
+          }
+
+          HAD_ERRORS=0
+
+          for p in $PREFIXES; do
+            if [ "$p" = "." ] || [ "$p" = "/" ] || [ -z "$p" ]; then
+              SRC_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}"
+              TARGET_DIR="."
+              LABEL="(root)"
+              SAFE="root"
+            else
+              SRC_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}/${p}"
+              TARGET_DIR="./$p"
+              LABEL="$p"
+              SAFE="$(echo "$p" | sed 's,[[:cntrl:]],_,g; s,[ /],_,g')"
+            fi
+
+            STAGE_DIR="${AZTMP}/stage_${SAFE}"
+            mkdir -p "$STAGE_DIR"
+
+            echo "==> Downloading prefix ${LABEL}"
+            set +e
+            azcopy copy "$SRC_URL" "$STAGE_DIR" --recursive --log-level INFO
+            AC_STATUS=$?
+            set -e
+
+            if [ "$AC_STATUS" -ne 0 ]; then
+              HAD_ERRORS=1
+              warn "AzCopy returned $AC_STATUS for ${LABEL}. See logs in $AZCOPY_LOG_LOCATION"
+            fi
+
+            # If nothing downloaded (or prefix doesn’t exist), continue
+            if ! find "$STAGE_DIR" -type f -print -quit | grep -q .; then
+              echo "No files found for ${LABEL}. Skipping."
+              rm -rf "$STAGE_DIR"
+              continue
+            fi
+
+            echo "==> Processing ${LABEL} in ~${BATCH_GIB} GiB batches"
+            while true; do
+              if ! move_batch_and_push "$STAGE_DIR" "$TARGET_DIR" "$LABEL"; then
+                break
+              fi
+            done
+
+            echo "==> Cleaning stage for ${LABEL}"
+            rm -rf "$STAGE_DIR"
+          done
+
+          echo "AzCopy logs at: $AZCOPY_LOG_LOCATION"
+
+          # If you want the job to fail when any AzCopy errored, uncomment:
+          # if [ "$HAD_ERRORS" -ne 0 ]; then exit 1; fi
+
+      - name: Final disk report
+        run: df -h
