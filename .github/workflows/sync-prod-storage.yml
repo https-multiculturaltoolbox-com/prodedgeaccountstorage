@@ -1,4 +1,4 @@
-name: Sync prodedgeaccountstorage to repo
+name: Sync prodedgeaccountstorage to repo (1GB commits)
 
 on:
   schedule:
@@ -13,22 +13,31 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout (shallow)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      # Use the official Azure CLI action (correct one)
-      - name: Sync all containers
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Azure CLI
         uses: azure/CLI@v2
         env:
           AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
           AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+          COMMIT_BYTES: "1073741824"   # 1 GB
         with:
           azcliversion: 2.63.0
           inlineScript: |
             set -euo pipefail
+            shopt -s extglob nullglob
 
             ROOT="azure/prodedgeaccountstorage"
-            mkdir -p "$ROOT"
+            MANIFEST_DIR=".sync-manifest"
+            mkdir -p "$ROOT" "$MANIFEST_DIR"
 
             echo "Listing containers in: $AZURE_STORAGE_ACCOUNT"
             mapfile -t CONTAINERS < <(az storage container list \
@@ -38,29 +47,106 @@ jobs:
 
             echo "Found containers: ${CONTAINERS[*]:-<none>}"
 
-            for c in "${CONTAINERS[@]}"; do
-              TARGET="$ROOT/$c"
-              echo "Syncing container '$c' -> $TARGET"
-              rm -rf "$TARGET"
-              mkdir -p "$TARGET"
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
 
-              az storage blob download-batch \
+            # Sparse checkout keeps only current container + workflow + manifest to save disk
+            git sparse-checkout init --cone
+            git sparse-checkout set ".github" "$ROOT" "$MANIFEST_DIR" || true
+
+            commit_chunk () {
+              local label="$1"
+              if [[ -n "$(git status --porcelain)" ]]; then
+                git add "$ROOT" "$MANIFEST_DIR"
+                git commit -m "$label ($(date -u +'%Y-%m-%d %H:%M:%S UTC'))"
+                git push
+              fi
+            }
+
+            for c in "${CONTAINERS[@]}"; do
+              echo "::group::Container $c"
+              TARGET="$ROOT/$c"
+              MANIFEST="$MANIFEST_DIR/$c.tsv"
+              mkdir -p "$TARGET"
+              touch "$MANIFEST"
+
+              # Narrow working tree to this container + manifests
+              git sparse-checkout set ".github" "$TARGET" "$MANIFEST_DIR"
+
+              # Load existing manifest: format "etag<TAB>name"
+              declare -A SEEN=()
+              while IFS=$'\t' read -r etag name; do
+                [[ -z "${etag:-}" || -z "${name:-}" ]] && continue
+                SEEN["$name"]="$etag"
+              done < <(cat "$MANIFEST" || true)
+
+              # Reset per-container counters
+              bytes_since_commit=0
+              downloaded_any=false
+
+              echo "Enumerating blobs for $c ..."
+              # name, etag, size
+              az storage blob list \
                 --account-name "$AZURE_STORAGE_ACCOUNT" \
                 --account-key "$AZURE_STORAGE_KEY" \
-                -s "$c" \
-                -d "$TARGET" \
-                --no-progress
+                --container-name "$c" \
+                --query "[].{name:name,etag:properties.etag,size:properties.contentLength}" \
+                -o tsv | while IFS=$'\t' read -r name etag size; do
+                  # Skip if manifest matches same etag (already synced)
+                  if [[ "${SEEN[$name]:-}" == "$etag" ]]; then
+                    # already up-to-date
+                    continue
+                  fi
+
+                  # Ensure subdirs exist for virtual folders
+                  mkdir -p "$(dirname "$TARGET/$name")"
+
+                  # Download single blob
+                  az storage blob download \
+                    --account-name "$AZURE_STORAGE_ACCOUNT" \
+                    --account-key "$AZURE_STORAGE_KEY" \
+                    --container-name "$c" \
+                    --name "$name" \
+                    --file "$TARGET/$name" \
+                    --overwrite \
+                    --no-progress 1>/dev/null
+
+                  # Update manifest (ensure unique line for this name)
+                  # Remove existing line for $name then append new etag+name
+                  tmpmf="$MANIFEST.tmp"
+                  awk -v n="$name" -F'\t' '!(NF>=2 && $2==n)' "$MANIFEST" > "$tmpmf" || true
+                  printf "%s\t%s\n" "$etag" "$name" >> "$tmpmf"
+                  mv "$tmpmf" "$MANIFEST"
+
+                  downloaded_any=true
+                  bytes_since_commit=$(( bytes_since_commit + size ))
+
+                  # Stage changes as we go (safer if a blob is huge)
+                  git add "$TARGET/$name" "$MANIFEST"
+
+                  # Commit chunk if threshold met
+                  if (( bytes_since_commit >= COMMIT_BYTES )); then
+                    commit_chunk "Sync '$c' (chunk ~$((bytes_since_commit/1024/1024)) MB)"
+                    bytes_since_commit=0
+
+                    # Trim untracked temp to save disk
+                    git clean -fdx
+                    df -h || true
+                  fi
+                done
+
+              # Final commit for this container if anything changed
+              if [[ "$downloaded_any" == true ]]; then
+                commit_chunk "Sync '$c' (final)"
+              else
+                echo "No changes for $c."
+              fi
+
+              # Clean between containers
+              git clean -fdx
+              df -h || true
+              echo "::endgroup::"
             done
 
-      - name: Commit & push if changes
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          if [[ -n "$(git status --porcelain)" ]]; then
-            git add azure/prodedgeaccountstorage
-            git commit -m "Sync prodedgeaccountstorage containers ($(date -u +'%Y-%m-%d %H:%M:%S UTC'))"
-            git push
-          else
-            echo "No changes to commit."
-          fi
+      - name: Final df -h
+        run: df -h
