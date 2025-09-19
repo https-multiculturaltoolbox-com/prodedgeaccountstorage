@@ -29,8 +29,8 @@ jobs:
           set -euo pipefail
           export AZCOPY_ACCOUNT_KEY="${AZURE_STORAGE_KEY}"
           for p in $PREFIXES; do
-            echo "==> LISTING: $p"
-            azcopy list "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}/${p}" | sed -n '1,200p'
+            echo "==> LIST $p"
+            azcopy list "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}/${p}" | sed -n '1,200p' || true
             echo
           done
       - name: Configure git author
