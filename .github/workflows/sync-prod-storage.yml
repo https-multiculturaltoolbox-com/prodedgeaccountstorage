@@ -1,12 +1,9 @@
-name: Sync Azure Blobs to Repo
+name: Sync Azure Blobs to Repo (batch, robust)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 2 * * *" # 02:00 UTC daily
-  push:
-    paths:
-      - .github/workflows/azure-blob-sync.yml
+    - cron: "0 2 * * *"   # 02:00 UTC daily
 
 permissions:
   contents: write
@@ -14,200 +11,147 @@ permissions:
 env:
   ROOT_DIR: azure
   MANIFEST_DIR: .sync-manifest
-  PENDING_LIST: .sync-manifest/_pending.txt
-  COMMIT_BYTES: 1073741824        # 1 GiB per commit
   COMMIT_AUTHOR_NAME: azure-sync-bot
   COMMIT_AUTHOR_EMAIL: noreply@example.com
-  # Set to a fixed branch like "main" if you want to always push there
-  COMMIT_BRANCH: ${{ github.ref_name }}
+  COMMIT_BRANCH: main
 
 jobs:
   sync:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Validate secrets / tokens
+      - name: Verify secrets
         shell: bash
+        env:
+          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+          AZURE_STORAGE_SAS_TOKEN: ${{ secrets.AZURE_STORAGE_SAS_TOKEN }}
+          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
         run: |
           set -euo pipefail
-          # You can use either a SAS token (preferred) or an Account Key.
-          if [ -z "${{ secrets.AZURE_STORAGE_SAS_TOKEN || '' }}" ] && [ -z "${{ secrets.AZURE_STORAGE_KEY || '' }}" ]; then
-            echo "ERROR: Provide either AZURE_STORAGE_SAS_TOKEN or AZURE_STORAGE_KEY in repo Settings → Secrets → Actions."
-            exit 1
+          if [ -z "${AZURE_STORAGE_ACCOUNT:-}" ]; then
+            echo "ERROR: Missing secret AZURE_STORAGE_ACCOUNT"; exit 1
           fi
-          : "${{ secrets.AZURE_STORAGE_ACCOUNT || '' }}"
-          if [ -z "${{ secrets.AZURE_STORAGE_ACCOUNT || '' }}" ]; then
-            echo "ERROR: AZURE_STORAGE_ACCOUNT secret is missing."
-            exit 1
+          if [ -z "${AZURE_STORAGE_SAS_TOKEN:-}" ] && [ -z "${AZURE_STORAGE_KEY:-}" ]; then
+            echo "ERROR: Provide AZURE_STORAGE_SAS_TOKEN (preferred) or AZURE_STORAGE_KEY"; exit 1
           fi
 
-      - name: Azure CLI (download + manifest)
+      - name: Azure CLI (mirror via download-batch + rebuild manifests)
         uses: azure/CLI@v2
+        env:
+          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+          AZURE_STORAGE_SAS_TOKEN: ${{ secrets.AZURE_STORAGE_SAS_TOKEN }}
+          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+          ROOT_DIR: ${{ env.ROOT_DIR }}
+          MANIFEST_DIR: ${{ env.MANIFEST_DIR }}
         with:
-          # 2.63.0 is the last Alpine image; you may omit to use latest Azure Linux image
           azcliversion: 2.63.0
           inlineScript: |
             set -euo pipefail
 
-            ROOT="${ROOT_DIR}"
-            MANIFEST_DIR="${MANIFEST_DIR}"
-            PENDING="${PENDING_LIST}"
+            mkdir -p "$ROOT_DIR" "$MANIFEST_DIR"
 
-            mkdir -p "$ROOT" "$MANIFEST_DIR"
-            : > "$PENDING"
-
-            # Build auth args: prefer SAS over account key
-            AUTH_ARGS=(
-              --account-name "${AZURE_STORAGE_ACCOUNT}"
-            )
+            # Build auth args (prefer SAS)
+            AUTH_ARGS=( --account-name "${AZURE_STORAGE_ACCOUNT}" )
             if [ -n "${AZURE_STORAGE_SAS_TOKEN:-}" ]; then
               AUTH_ARGS+=( --sas-token "${AZURE_STORAGE_SAS_TOKEN}" )
             else
               AUTH_ARGS+=( --account-key "${AZURE_STORAGE_KEY}" )
             fi
 
-            echo "Listing containers in: ${AZURE_STORAGE_ACCOUNT}"
+            echo "Listing containers in ${AZURE_STORAGE_ACCOUNT}..."
+            mapfile -t CONTAINERS < <(
+              az storage container list \
+                --only-show-errors \
+                "${AUTH_ARGS[@]}" \
+                --query "[].name" -o tsv
+            )
 
-            # --- Containers pagination loop ---
-            container_marker=""
-            while :; do
-              mapfile -t containers < <(
-                az storage container list \
+            echo "Found ${#CONTAINERS[@]} containers."
+            for c in "${CONTAINERS[@]}"; do
+              [ -z "$c" ] && continue
+              echo "::group::Sync container: $c"
+              TARGET="${ROOT_DIR}/${c}"
+              MANIFEST="${MANIFEST_DIR}/${c}.tsv"
+              mkdir -p "${TARGET}"
+
+              # 1) Mirror everything in this container (no per-blob --name)
+              az storage blob download-batch \
+                --only-show-errors \
+                "${AUTH_ARGS[@]}" \
+                --source "$c" \
+                --destination "${TARGET}" \
+                --overwrite
+
+              # 2) Rebuild manifest with pagination (etag<TAB>name)
+              tmp="${MANIFEST}.tmp"
+              : > "$tmp"
+              blob_marker=""
+              while :; do
+                # page -> json
+                page_json="$(az storage blob list \
                   --only-show-errors \
                   "${AUTH_ARGS[@]}" \
-                  ${container_marker:+--marker "$container_marker"} \
-                  --query "[].name" -o tsv
-              )
-
-              container_marker="$(az storage container list \
+                  --container-name "$c" \
+                  ${blob_marker:+--marker "$blob_marker"} \
+                  -o json)"
+                # append to manifest tmp
+                python3 - "$tmp" <<'PY'
+import sys, json
+out = sys.argv[1]
+data = json.loads(sys.stdin.read())
+with open(out, "a", encoding="utf-8") as f:
+    for b in data:
+        name = (b.get("name") or "").strip()
+        etag = ((b.get("properties") or {}).get("etag") or "").strip()
+        if name and etag:
+            f.write(f"{etag}\t{name}\n")
+PY
+                # next marker
+                blob_marker="$(az storage blob list \
                   --only-show-errors \
                   "${AUTH_ARGS[@]}" \
-                  ${container_marker:+--marker "$container_marker"} \
-                  --query "nextMarker" -o tsv || true)"
-
-              for c in "${containers[@]}"; do
-                [ -z "$c" ] && continue
-                echo "::group::Container $c"
-                TARGET="$ROOT/$c"
-                MANIFEST="$MANIFEST_DIR/$c.tsv"
-                mkdir -p "$TARGET"
-                [ -f "$MANIFEST" ] || : > "$MANIFEST"
-
-                # --- Blobs pagination loop ---
-                blob_marker=""
-                while :; do
-                  while IFS=$'\t' read -r name etag size || [ -n "${name-}" ]; do
-                    name="${name%$'\r'}"; etag="${etag%$'\r'}"; size="${size%$'\r'}"
-                    if [ -z "${name:-}" ] || [ -z "${etag:-}" ]; then
-                      continue
-                    fi
-
-                    existing_etag="$(awk -F'\t' -v n="$name" '$2==n {print $1; exit}' "$MANIFEST" 2>/dev/null || true)"
-                    if [ "$existing_etag" = "$etag" ]; then
-                      continue
-                    fi
-
-                    dirp="$(dirname "$TARGET/$name")"
-                    [ -d "$dirp" ] || mkdir -p "$dirp"
-
-                    az storage blob download \
-                      --only-show-errors \
-                      "${AUTH_ARGS[@]}" \
-                      --container-name "$c" \
-                      --name "$name" \
-                      --file "$TARGET/$name" \
-                      --overwrite \
-                      --no-progress 1>/dev/null
-
-                    tmpmf="$MANIFEST.tmp"
-                    awk -F'\t' -v n="$name" '!(NF>=2 && $2==n)' "$MANIFEST" > "$tmpmf" 2>/dev/null || true
-                    printf "%s\t%s\n" "$etag" "$name" >> "$tmpmf"
-                    mv "$tmpmf" "$MANIFEST"
-
-                    printf "%s\n" "$TARGET/$name" >> "$PENDING"
-                  done < <(
-                    az storage blob list \
-                      --only-show-errors \
-                      "${AUTH_ARGS[@]}" \
-                      --container-name "$c" \
-                      ${blob_marker:+--marker "$blob_marker"} \
-                      --query "[].{name:name,etag:properties.etag,size:properties.contentLength}" \
-                      -o tsv
-                  )
-
-                  blob_marker="$(az storage blob list \
-                      --only-show-errors \
-                      "${AUTH_ARGS[@]}" \
-                      --container-name "$c" \
-                      ${blob_marker:+--marker "$blob_marker"} \
-                      --query 'nextMarker' -o tsv || true)"
-                  [ -z "$blob_marker" ] && break
-                done
-
-                echo "::endgroup::"
+                  --container-name "$c" \
+                  ${blob_marker:+--marker "$blob_marker"} \
+                  --query 'nextMarker' -o tsv || true)"
+                [ -z "$blob_marker" ] && break
               done
 
-              [ -z "$container_marker" ] && break
+              # dedupe by name, keep last etag if duplicates
+              if [ -s "$tmp" ]; then
+                # sort by name (field 2), unique by name, keep last occurrence
+                tac "$tmp" | awk -F'\t' '!seen[$2]++' | tac > "$MANIFEST"
+                rm -f "$tmp"
+              else
+                : > "$MANIFEST"
+              fi
+
+              echo "::endgroup::"
             done
 
-            echo "Pending file list written to $PENDING"
-            echo "Summary: $(wc -l < "$PENDING" | tr -d ' ') files downloaded."
+      - name: Commit changes
+        shell: bash
         env:
-          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
-          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
-          AZURE_STORAGE_SAS_TOKEN: ${{ secrets.AZURE_STORAGE_SAS_TOKEN }} # optional; if set, preferred
           ROOT_DIR: ${{ env.ROOT_DIR }}
           MANIFEST_DIR: ${{ env.MANIFEST_DIR }}
-          PENDING_LIST: ${{ env.PENDING_LIST }}
-
-      - name: Commit changes in size-capped batches
-        if: ${{ always() }}
-        shell: bash
+          COMMIT_AUTHOR_NAME: ${{ env.COMMIT_AUTHOR_NAME }}
+          COMMIT_AUTHOR_EMAIL: ${{ env.COMMIT_AUTHOR_EMAIL }}
+          COMMIT_BRANCH: ${{ env.COMMIT_BRANCH }}
         run: |
           set -euo pipefail
-
           git config user.name  "${COMMIT_AUTHOR_NAME}"
           git config user.email "${COMMIT_AUTHOR_EMAIL}"
 
-          PENDING="${PENDING_LIST}"
-          [ -s "$PENDING" ] || { echo "Nothing to commit."; exit 0; }
+          git add "${ROOT_DIR}" "${MANIFEST_DIR}"
 
-          threshold="${COMMIT_BYTES}"
-          batch_bytes=0
-          declare -a batch=()
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
 
-          commit_batch() {
-            [ "${#batch[@]}" -gt 0 ] || return 0
-            echo "Committing ${#batch[@]} files (~${batch_bytes} bytes)"
-            git add "${batch[@]}" "${MANIFEST_DIR}"/*.tsv
-            if ! git diff --cached --quiet; then
-              git commit -m "Sync Azure blobs (batch ≤ ${COMMIT_BYTES} bytes)"
-              git push origin "${COMMIT_BRANCH}"
-            else
-              echo "No staged changes; skipping commit."
-            fi
-            batch=()
-            batch_bytes=0
-          }
-
-          while IFS= read -r f; do
-            [ -f "$f" ] || continue
-            sz=$(stat -c%s "$f" || echo 0)
-            if [ "$((batch_bytes + sz))" -gt "$threshold" ] && [ "${#batch[@]}" -gt 0 ]; then
-              commit_batch
-            fi
-            batch+=("$f")
-            batch_bytes=$((batch_bytes + sz))
-          done < "$PENDING"
-
-          commit_batch
-
-      - name: Workflow summary
-        if: ${{ always() }}
-        run: |
-          echo "Done. Check commit history for batches."
+          git commit -m "Mirror Azure blobs & update manifests"
+          git push origin "${COMMIT_BRANCH}"
