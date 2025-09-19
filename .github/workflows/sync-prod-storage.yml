@@ -1,12 +1,12 @@
-name: Sync Azure Blob (public) to Repo
+name: Sync Azure Blob (chunked) to Repo
 
 on:
   workflow_dispatch:
     inputs:
       prefixes:
-        description: "Space-separated prefixes (e.g., logs/2025-09-18/ images/)"
+        description: "Space-separated prefixes (e.g., files/ logs/2025-09-18/ images/)"
         required: true
-        default: "logs/ images/"
+        default: "files/"
 
 permissions:
   contents: write
@@ -19,13 +19,28 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure git author
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Install AzCopy (v10)
+        run: |
+          set -e
+          curl -sL https://aka.ms/downloadazcopy-v10-linux | tar -xz --strip-components=1
+          sudo mv azcopy /usr/local/bin/azcopy
+          azcopy --version
+
       - name: Download and commit per chunk (account key auth)
         env:
           PREFIXES: ${{ github.event.inputs.prefixes }}
           AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
         run: |
           set -euo pipefail
-      
+
           # 0) Sanity checks
           if [ -z "${AZURE_STORAGE_KEY:-}" ]; then
             echo "::error::AZURE_STORAGE_KEY secret is missing."
@@ -39,29 +54,29 @@ jobs:
             echo "::error::No prefixes provided."
             exit 1
           fi
-      
+
           # 1) Tell AzCopy to use the shared key (NO SAS needed in URL)
           export AZCOPY_ACCOUNT_KEY="${AZURE_STORAGE_KEY}"
-      
+
           # Optional: write logs to a known path for debugging
           export AZCOPY_LOG_LOCATION="$(pwd)/.azcopy-logs"
-      
+
           TMPROOT="$(mktemp -d)"
           trap 'rm -rf "$TMPROOT"' EXIT
-      
+
           for p in $PREFIXES; do
             echo "==> Downloading prefix: $p"
             SRC_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}/${p}"
             DEST_LOCAL="${TMPROOT}/${p}"
             mkdir -p "$DEST_LOCAL"
-      
+
             # Use account-key auth (URL has no SAS)
             azcopy copy "$SRC_URL" "$DEST_LOCAL" --recursive --log-level INFO
-      
+
             echo "==> Copy into repo: $p"
             mkdir -p "./$p"
             rsync -a "$DEST_LOCAL"/ "./$p"/ || true
-      
+
             echo "==> Commit & push for $p"
             git add "$p"
             if ! git diff --cached --quiet -- "$p"; then
@@ -70,9 +85,9 @@ jobs:
             else
               echo "No changes for $p."
             fi
-      
+
             echo "==> Clean temp for $p"
             rm -rf "$DEST_LOCAL"
-    done
+          done
 
-    echo "AzCopy logs at: $AZCOPY_LOG_LOCATION"
+          echo "AzCopy logs at: $AZCOPY_LOG_LOCATION"
