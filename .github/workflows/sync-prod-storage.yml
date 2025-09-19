@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       prefixes:
-        description: "Space-separated prefixes (use '.' for whole container)"
+        description: "Space-separated prefixes (e.g., 'logs/2025-09-18/ images/'). Avoid '.' on large containers."
         required: true
-        default: "."
+        default: "logs/2025-09-18/"
 
 permissions:
   contents: write
@@ -19,8 +19,17 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # Free space before big transfers
+      - name: Cleanup disk space before sync
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc "/usr/local/share/boost" || true
+          sudo docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
 
       - name: Configure git author
         run: |
@@ -34,7 +43,7 @@ jobs:
           sudo mv azcopy /usr/local/bin/azcopy
           azcopy --version
 
-      - name: Download and commit per chunk (account key auth + root fallback + robust)
+      - name: Sync prefixes (commit → push → evict from disk)
         env:
           PREFIXES: ${{ github.event.inputs.prefixes }}
           AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
@@ -45,72 +54,71 @@ jobs:
           : "${AZURE_CONTAINER:?AZURE_CONTAINER missing}"
           : "${PREFIXES:?No prefixes provided}"
 
-          # Improve stability on busy runners
-          ulimit -n 65536 || true
+          # Safety: syncing the entire container (".") will likely fill disk on shared runners
+          if [ "$PREFIXES" = "." ]; then
+            echo "::error::'.' (whole container) is not allowed on shared runners. Pass smaller prefixes (e.g., daily folders)."
+            exit 1
+          fi
 
-          # AzCopy auth & tuning
+          # Tune & auth
+          ulimit -n 65536 || true
           export AZCOPY_ACCOUNT_KEY="${AZURE_STORAGE_KEY}"
-          export AZCOPY_CONCURRENCY_VALUE=8     # <-- use env var instead of a CLI flag
+          export AZCOPY_CONCURRENCY_VALUE=8
           export AZCOPY_LOG_LOCATION="$(pwd)/.azcopy-logs"
           mkdir -p "$AZCOPY_LOG_LOCATION"
+
+          # Keep only one folder in the working tree at a time
+          git sparse-checkout init --cone
 
           TMPROOT="$(mktemp -d)"
           trap 'rm -rf "$TMPROOT"' EXIT
 
-          HAD_ERRORS=0
-
           for p in $PREFIXES; do
-            if [ "$p" = "." ] || [ "$p" = "/" ] || [ -z "$p" ]; then
-              SRC_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}"
-              TARGET_DIR="."
-              LABEL="(root)"
-              DEST_LOCAL="${TMPROOT}/root"
-            else
-              SRC_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}/${p}"
-              TARGET_DIR="./$p"
-              LABEL="$p"
-              DEST_LOCAL="${TMPROOT}/${p}"
-            fi
+            echo "==> Processing prefix: $p"
 
-            echo "==> Downloading: $LABEL"
-            mkdir -p "$DEST_LOCAL"
+            # Evict everything except this prefix from the worktree (frees disk without committing deletions)
+            git sparse-checkout set "$p"
 
-            # Run AzCopy; don't hard-fail if it returns non-zero
+            SRC_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}/${p}"
+            DEST_LOCAL="${TMPROOT}/${p}"
+            TARGET_DIR="./$p"
+
+            mkdir -p "$DEST_LOCAL" "$TARGET_DIR"
+
+            # Download this chunk
             set +e
             azcopy copy "$SRC_URL" "$DEST_LOCAL" --recursive --log-level INFO
             AC_STATUS=$?
             set -e
 
-            # Summarize errors (if any)
-            LASTLOG="$(ls -t .azcopy-logs/*.log 2>/dev/null | head -n1 || true)"
-            if [ "$AC_STATUS" -ne 0 ]; then
-              HAD_ERRORS=1
-              echo "::warning::AzCopy returned $AC_STATUS on $LABEL. See $LASTLOG"
-              if [ -n "$LASTLOG" ]; then
-                echo "---- AzCopy error samples for $LABEL ----"
-                tail -n 200 "$LASTLOG" | sed 's/^/LOG: /'
-                echo "----------------------------------------"
-              fi
-            fi
-
-            echo "==> Copy into repo: $LABEL"
-            mkdir -p "$TARGET_DIR"
+            # Copy into repo
             rsync -a "$DEST_LOCAL"/ "$TARGET_DIR"/ || true
 
-            echo "==> Commit & push for $LABEL"
+            # Stage and avoid >95MB files (GitHub hard-limit ~100MB)
+            BIG=$(find "$TARGET_DIR" -type f -size +95M 2>/dev/null || true)
             git add "$TARGET_DIR"
-            if ! git diff --cached --quiet -- "$TARGET_DIR"; then
-              git commit -m "Sync from Azure ${LABEL} - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-              git push
-            else
-              echo "No changes for ${LABEL}."
+            if [ -n "$BIG" ]; then
+              echo "::warning::Skipping files >95MB in $p:"
+              echo "$BIG" | sed 's/^/ - /'
+              echo "$BIG" | xargs -r git reset -q
             fi
 
-            echo "==> Clean temp for $LABEL"
+            if ! git diff --cached --quiet -- "$TARGET_DIR"; then
+              git commit -m "Sync from Azure ${p} - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+              git push
+            else
+              echo "No changes for ${p}."
+            fi
+
+            # Clean temp and show remaining space
             rm -rf "$DEST_LOCAL"
+            df -h
+
+            # Warn (don’t fail) on AzCopy issues to let later prefixes proceed
+            if [ "$AC_STATUS" -ne 0 ]; then
+              echo "::warning::AzCopy returned exit $AC_STATUS for ${p}. See logs in $AZCOPY_LOG_LOCATION"
+              tail -n 100 "$(ls -t .azcopy-logs/*.log | head -n1)" || true
+            fi
           done
 
-          echo "AzCopy logs at: $AZCOPY_LOG_LOCATION"
-
-          # If you prefer the job to fail on partial errors, uncomment:
-          # if [ "$HAD_ERRORS" -ne 0 ]; then exit 1; fi
+          echo "Done. Only the last processed prefix remains in the workspace."
