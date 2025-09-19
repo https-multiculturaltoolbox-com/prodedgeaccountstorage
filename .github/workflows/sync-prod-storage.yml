@@ -13,25 +13,23 @@ permissions:
 
 env:
   AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
-  AZURE_CONTAINER: ${{ secrets.AZURE_CONTAINER }}
+  AZURE_CONTAINER:       ${{ secrets.AZURE_CONTAINER }}
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Configure git author
+      - name: Configure git author & disable sparse warnings
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Ensure sparse-checkout (if enabled earlier) doesn't block us
           git sparse-checkout disable || true
           git config advice.updateSparsePath false || true
 
-      # Optional but helpful on busy runners
+      # Optional but helpful on crowded runners
       - name: Cleanup disk space before sync (optional)
         continue-on-error: true
         run: |
@@ -42,16 +40,20 @@ jobs:
           sudo apt-get clean || true
           df -h
 
-      - name: Prep roomy /mnt dirs & move repo there
+      - name: Prep roomy /mnt and move repo there
         run: |
           set -euo pipefail
-          sudo mkdir -p /mnt/work /mnt/aztmp /mnt/work/tmp
-          sudo chown -R "$USER":"$USER" /mnt/work /mnt/aztmp
-          # Move the checked-out repo to /mnt so git writes live on the large volume
+          sudo mkdir -p /mnt/work /mnt/aztmp
+          sudo chown -R "$USER:$USER" /mnt/work /mnt/aztmp
+
+          # Move the checked-out repo to /mnt so all writes happen on the big disk
           rsync -a --delete "$GITHUB_WORKSPACE"/ /mnt/work/repo/
-          echo "REPO_DIR=/mnt/work/repo" >> "$GITHUB_ENV"
-          echo "TMP_BASE=/mnt/work/tmp"    >> "$GITHUB_ENV"
-          echo "AZTMP=/mnt/aztmp"          >> "$GITHUB_ENV"
+
+          {
+            echo "REPO_DIR=/mnt/work/repo"
+            echo "AZTMP=/mnt/aztmp"
+          } >> "$GITHUB_ENV"
+
           df -h / /mnt || true
 
       - name: Install AzCopy (v10)
@@ -61,10 +63,10 @@ jobs:
           sudo mv azcopy /usr/local/bin/azcopy
           azcopy --version
 
-      - name: Download and commit per prefix (account key auth + robust)
+      - name: Download → commit per prefix (no staging copy)
         env:
-          PREFIXES:            ${{ github.event.inputs.prefixes }}
-          AZURE_STORAGE_KEY:   ${{ secrets.AZURE_STORAGE_KEY }}
+          PREFIXES:          ${{ github.event.inputs.prefixes }}
+          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
         working-directory: ${{ env.REPO_DIR }}
         run: |
           set -euo pipefail
@@ -74,46 +76,43 @@ jobs:
           : "${AZURE_CONTAINER:?AZURE_CONTAINER missing}"
           : "${PREFIXES:?No prefixes provided}"
 
-          # Make azcopy more stable on busy runners
+          # Bigger file limit for busy runners
           ulimit -n 65536 || true
 
-          # AzCopy auth & tuning (env var replaces the removed CLI flag)
+          # Route ALL temp files to /mnt (large disk)
+          export TMPDIR="${AZTMP}"
+          export TEMP="${AZTMP}"
+          export TMP="${AZTMP}"
+
+          # AzCopy auth/tuning (use env var instead of removed CLI flag)
           export AZCOPY_ACCOUNT_KEY="${AZURE_STORAGE_KEY}"
           export AZCOPY_CONCURRENCY_VALUE=8
           export AZCOPY_LOG_LOCATION="${AZTMP}/azcopy-logs"
           export AZCOPY_JOB_PLAN_LOCATION="${AZTMP}/azcopy-plan"
           mkdir -p "$AZCOPY_LOG_LOCATION" "$AZCOPY_JOB_PLAN_LOCATION"
 
-          # Temp root lives on /mnt (large disk), not inside the repo
-          TMPROOT="$(mktemp -d -p "${TMP_BASE}" azsync.XXXXXX)"
-          trap 'rm -rf "$TMPROOT"' EXIT
-
           HAD_ERRORS=0
 
-          # Iterate prefixes provided by the dispatch input.
           for p in $PREFIXES; do
             if [ "$p" = "." ] || [ "$p" = "/" ] || [ -z "$p" ]; then
               SRC_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}"
               TARGET_DIR="."
               LABEL="(root)"
-              DEST_LOCAL="${TMPROOT}/root"
             else
               SRC_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_CONTAINER}/${p}"
               TARGET_DIR="./$p"
               LABEL="$p"
-              DEST_LOCAL="${TMPROOT}/${p}"
             fi
 
-            echo "==> Downloading: $LABEL"
-            mkdir -p "$DEST_LOCAL"
+            echo "==> Downloading into repo: $LABEL -> $TARGET_DIR"
+            mkdir -p "$TARGET_DIR"
 
-            # Run AzCopy; do not hard-fail the whole job on non-zero so we can still commit what we got
+            # Direct-copy into the repo (avoids doubling disk usage)
             set +e
-            azcopy copy "$SRC_URL" "$DEST_LOCAL" --recursive --log-level INFO
+            azcopy copy "$SRC_URL" "$TARGET_DIR" --recursive --overwrite=true --log-level INFO
             AC_STATUS=$?
             set -e
 
-            # Summarize any AzCopy issues (keep logs off-repo under /mnt/aztmp)
             LASTLOG="$(ls -t "${AZCOPY_LOG_LOCATION}"/*.log 2>/dev/null | head -n1 || true)"
             if [ "$AC_STATUS" -ne 0 ]; then
               HAD_ERRORS=1
@@ -125,32 +124,26 @@ jobs:
               fi
             fi
 
-            echo "==> Rsync into repo: $LABEL"
-            mkdir -p "$TARGET_DIR"
-            # Keep copy efficient; source on /mnt, target is repo on /mnt as well
-            rsync -a "$DEST_LOCAL"/ "$TARGET_DIR"/ || true
-
-            echo "==> Commit & push for $LABEL"
+            echo "==> Git add/commit/push: $LABEL"
+            # Ensure git also uses /mnt for any temps
+            export TMPDIR="${AZTMP}"
             git add --all "$TARGET_DIR" || true
             if ! git diff --cached --quiet -- "$TARGET_DIR"; then
               git commit -m "Sync from Azure ${LABEL} - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
               git push
+              # Keep object store compact on the runner
+              git gc --prune=now || true
             else
               echo "No changes for ${LABEL}."
             fi
 
-            echo "==> Clean temp for $LABEL"
-            rm -rf "$DEST_LOCAL"
-
-            # Optional: compact the repo occasionally to save space on the runner
-            # git gc --prune=now || true
+            df -h "$PWD" /mnt || true
           done
 
           echo "AzCopy logs at: $AZCOPY_LOG_LOCATION"
-          df -h "${PWD}" /mnt || true
 
-          # If you want the job to fail when AzCopy had any errors, uncomment below:
+          # Uncomment to fail the job if any AzCopy errors occurred
           # if [ "$HAD_ERRORS" -ne 0 ]; then
-          #   echo "::error::Finished with AzCopy errors (see logs above)."
+          #   echo "::error::Finished with AzCopy errors (see logs)."
           #   exit 1
           # fi
